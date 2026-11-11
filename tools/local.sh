@@ -49,6 +49,8 @@ setup)
     echo "フロントエンド: $(front)/frontend, $(front)/web/index.html, $(front)/tools/webtest.mjs"
     ;;
 build)
+    # 土台の全体ビルドが走っている間は待つ（同じファイルを二重にコンパイルしないため。ccache に溜まる）
+    while pgrep -x ninja >/dev/null && [ ! -f "$ROOT/build/bin/Release/azahar_web.wasm" ]; do sleep 20; done
     flock 9
     start=$(date +%s)
     status=0
