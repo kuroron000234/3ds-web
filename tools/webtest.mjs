@@ -17,8 +17,9 @@ import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-const ROOT = path.join(homedir(), '3ds-web-build');
-const require = createRequire(path.join(ROOT, 'node') + '/');
+// 既定はラップトップの配置。Cloud Shell では tools/local.sh が環境変数で切り替える
+const ROOT = process.env.WEBTEST_ROOT || path.join(homedir(), '3ds-web-build');
+const require = createRequire((process.env.WEBTEST_NODE || path.join(ROOT, 'node')) + '/');
 const { chromium } = require('playwright-core');
 
 const opts = { rom: 'boot.3dsx', graphics: 'OpenGL', seconds: 10, logLines: 40, options: [], chromebook: false };
@@ -66,9 +67,10 @@ const url = `http://127.0.0.1:${server.address().port}/`;
 
 // GPU は内蔵の Intel UHD を使う（ハイブリッド構成の既定。NVIDIA は使わない）
 const browser = await chromium.launch({
-  executablePath: '/usr/bin/google-chrome',
+  executablePath: process.env.WEBTEST_CHROME || '/usr/bin/google-chrome',
   headless: true,
-  args: ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=gl-egl'],
+  // Cloud Shell には GPU が無いので、既定の SwiftShader（CPU 描画）に任せる
+  args: process.env.WEBTEST_NO_GPU ? [] : ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=gl-egl'],
 });
 const result = { agent: opts.agent, rom: opts.rom, graphics: opts.graphics, chromebook: opts.chromebook };
 try {

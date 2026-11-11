@@ -71,3 +71,17 @@ tools/agent.sh <name> backup             # ブランチをラップトップへ�
 終わったら（または行き詰まったら）次をまとめて返す:
 何をしたか、コミット（ハッシュと要約）、テスト結果（変更前後の `glslErrors`・`errors`・`pageErrors`・`fps`）、
 残っている問題、統合時に気をつけること（他の担当と衝突しそうな箇所）。
+
+## ラップトップが使えないとき（Cloud Shell だけで作業）
+
+`tools/agent.sh` の代わりに `tools/local.sh <name> setup|build|test|backup` を使う。
+
+- 作業ツリーは `/tmp/3ds/agents/<name>/azahar`（統合ツリーの複製、ブランチ `wip/<name>`）。
+  `setup --frontend` を付けたエージェントは `/tmp/3ds/agents/<name>/home` にこのリポジトリの作業ツリーも持つ
+- ビルドとテストは 2 コアを分け合うので、自動で 1 つずつ順番に走る（待たされることがある）。
+  ビルドは変更が少なければ数分。無駄なビルドを避け、まとめて直してからビルドする
+- テストのブラウザは Chromium + SwiftShader（CPU 描画の WebGL2）。描画の正しさは見られるが、
+  速度の数字は当てにならない。`--chromebook` は使えない。メモリが少ないので `--seconds` は短めに
+- `backup` はブランチを `~/3ds-wip/<name>.bundle` に退避する。Cloud Shell は数時間おきに再起動して
+  `/tmp` が消えるので、コミットのたびに必ず実行する（次の `setup` で自動的に復元される）
+- ルール 6（Cloud Shell でブラウザやビルドを動かさない）は、このモードでは `tools/local.sh` 経由に限り例外
