@@ -62,6 +62,9 @@ build)
     ls -l "$A/out"
     ;;
 test)
+    # フロントエンドを専用に持つエージェントは、ページの API に合わせた webtest.mjs も持てる
+    webtest="$REPO/tools/webtest.mjs"
+    [ -f "$A/webtest.mjs" ] && webtest="$A/webtest.mjs"
     chromebook=0
     args=()
     for a in "$@"; do
@@ -73,10 +76,10 @@ test)
         exec 9>"$ROOT/chromebook.lock"
         flock 9
         systemd-run --user --scope --quiet -p MemoryMax="$CHROMEBOOK_MEM" -- \
-            taskset -c "$CHROMEBOOK_CPUS" node "$REPO/tools/webtest.mjs" --agent "$name" \
+            taskset -c "$CHROMEBOOK_CPUS" node "$webtest" --agent "$name" \
             --chromebook "${args[@]}"
     else
-        taskset -c "$BUILD_CPUS" node "$REPO/tools/webtest.mjs" --agent "$name" "${args[@]}"
+        taskset -c "$BUILD_CPUS" node "$webtest" --agent "$name" "${args[@]}"
     fi
     ;;
 *)

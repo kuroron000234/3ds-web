@@ -47,6 +47,9 @@ sync() {
     ft=$(front_tree)
     send_files "$ft/frontend" "$R/agents/$name/frontend" $(cd "$ft/frontend" && ls)
     send_files "$ft/web" "$R/agents/$name/web" index.html
+    if [ -d "$HOME_WT" ]; then
+        send_files "$ft/tools" "$R/agents/$name" webtest.mjs
+    fi
 }
 
 case "$cmd" in
