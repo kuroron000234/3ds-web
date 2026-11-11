@@ -20,11 +20,12 @@ class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
         name = path.split("?", 1)[0].split("#", 1)[0].lstrip("/") or "index.html"
         name = os.path.basename(name)  # サブディレクトリは使わない
-        # ビルド直後の成果物を、Home 側に退避したコピーより優先する
-        for root in (BUILD_DIR, WEB_DIR, ROMS_DIR):
-            candidate = os.path.join(root, name)
-            if os.path.isfile(candidate):
-                return candidate
+        # 同じ名前が複数の場所にあれば、更新が新しい方を返す
+        # （Cloud Shell のビルド、ラップトップから持ち帰った web/ のコピーなど）
+        candidates = [os.path.join(root, name) for root in (BUILD_DIR, WEB_DIR, ROMS_DIR)]
+        existing = [c for c in candidates if os.path.isfile(c)]
+        if existing:
+            return max(existing, key=os.path.getmtime)
         return os.path.join(WEB_DIR, name)
 
     def end_headers(self):
