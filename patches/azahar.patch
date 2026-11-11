@@ -1,0 +1,188 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e99de6a81..e1c6528b0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -317,7 +317,7 @@ function(check_submodules_present)
+         endif()
+     endforeach()
+ endfunction()
+-if (EXISTS "${PROJECT_SOURCE_DIR}/.git/objects")
++if (EXISTS "${PROJECT_SOURCE_DIR}/.git/objects" AND NOT EMSCRIPTEN)
+     # only check submodules when source is obtained via Git
+     check_submodules_present()
+ endif()
+@@ -445,6 +445,12 @@ endif()
+ 
+ # Use system tsl::robin_map if available (otherwise we fallback to version bundled with dynarmic)
+ find_package(tsl-robin-map QUIET)
++if (EMSCRIPTEN AND NOT TARGET tsl::robin_map)
++    # dynarmic (which bundles robin_map) is not built for WebAssembly
++    add_library(tsl_robin_map INTERFACE)
++    target_include_directories(tsl_robin_map SYSTEM INTERFACE "${ROBIN_MAP_INCLUDE_DIR}")
++    add_library(tsl::robin_map ALIAS tsl_robin_map)
++endif()
+ 
+ # Platform-specific library requirements
+ # ======================================
+diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
+index e28f9941b..b2aed11eb 100644
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -99,3 +99,29 @@ else()
+ endif()
+ 
+ add_custom_target(azahar_libretro DEPENDS citra_libretro)
++
++# 3DS-web: browser build. Links the libretro core with a minimal web frontend
++# into a runnable .js/.wasm pair instead of a shared library.
++if(EMSCRIPTEN)
++  target_compile_definitions(citra_libretro_common PRIVATE USING_GLES)
++  target_compile_definitions(citra_libretro PRIVATE USING_GLES)
++
++  if(WEB_FRONTEND_DIR)
++    add_executable(azahar_web
++            ${WEB_FRONTEND_DIR}/main.cpp
++            citra_libretro.cpp
++            citra_libretro.h
++            $<TARGET_OBJECTS:citra_libretro_common>)
++    target_compile_definitions(azahar_web PRIVATE HAVE_LIBRETRO USING_GLES)
++    target_link_libraries(azahar_web PRIVATE citra_common citra_core video_core
++            Boost::boost dds-ktx libretro tsl::robin_map glad Threads::Threads)
++    target_link_options(azahar_web PRIVATE
++            -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3
++            -sGL_ENABLE_GET_PROC_ADDRESS
++            -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
++            -sPTHREAD_POOL_SIZE=8 -sSTACK_SIZE=5242880
++            -sFORCE_FILESYSTEM
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game
++            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap)
++  endif()
++endif()
+diff --git a/src/common/hash.h b/src/common/hash.h
+index c08e4b2a0..119a196d4 100644
+--- a/src/common/hash.h
++++ b/src/common/hash.h
+@@ -7,6 +7,7 @@
+ #include <cstddef>
+ #include <cstring>
+ #include <string>
++#include <type_traits>
+ #include <xxhash.h>
+ #include "cityhash.h"
+ #include "common/common_types.h"
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index cad2108c3..da65be0a6 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -92,7 +92,10 @@ void SetCurrentThreadName(const char* name) {
+ // MinGW with the POSIX threading model does not support pthread_setname_np
+ #if !defined(_WIN32) || defined(_MSC_VER)
+ void SetCurrentThreadName(const char* name) {
+-#ifdef __APPLE__
++#ifdef __EMSCRIPTEN__
++    // Thread names are not supported by the WebAssembly pthread runtime
++    (void)name;
++#elif defined(__APPLE__)
+     pthread_setname_np(name);
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+diff --git a/src/common/web_util.cpp b/src/common/web_util.cpp
+index a2bbc01dc..aed9a03be 100644
+--- a/src/common/web_util.cpp
++++ b/src/common/web_util.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <cstdlib>
+ #include "web_util.h"
+ 
+ namespace Common {
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 814863e52..282c30c60 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -577,6 +577,14 @@ if (NOT MSVC)
+         arm/fastinterp/fastinterp_flags.h
+         arm/fastinterp/fastinterp_types.h
+     )
++    # FastInterp uses the instruction tick table, which is otherwise only
++    # built alongside dynarmic (x86_64 / arm64).
++    if (NOT ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE))
++        target_sources(citra_core PRIVATE
++            arm/dynarmic/arm_tick_counts.cpp
++            arm/dynarmic/arm_tick_counts.h
++        )
++    endif()
+ endif()
+ 
+ if (CITRA_USE_PRECOMPILED_HEADERS)
+diff --git a/src/core/nus_download.cpp b/src/core/nus_download.cpp
+index 28442a8d7..5d18f98db 100644
+--- a/src/core/nus_download.cpp
++++ b/src/core/nus_download.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <exception>
+ #include <memory>
+ #include <httplib.h>
+ #include "common/logging/log.h"
+diff --git a/src/network/artic_base/artic_base_client.h b/src/network/artic_base/artic_base_client.h
+index 193ccde63..2d14ced5f 100644
+--- a/src/network/artic_base/artic_base_client.h
++++ b/src/network/artic_base/artic_base_client.h
+@@ -13,6 +13,7 @@
+ #include "string"
+ #include "thread"
+ #include "utility"
++#include "vector"
+ 
+ #include "artic_base_common.h"
+ #include "network/socket_manager.h"
+diff --git a/src/video_core/pica/shader_setup.h b/src/video_core/pica/shader_setup.h
+index 319042958..e29b14fbf 100644
+--- a/src/video_core/pica/shader_setup.h
++++ b/src/video_core/pica/shader_setup.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <optional>
+ #include "common/vector_math.h"
+ #include "video_core/pica/packed_attribute.h"
+diff --git a/src/video_core/renderer_opengl/gl_driver.cpp b/src/video_core/renderer_opengl/gl_driver.cpp
+index 0c02521d6..d25ad19eb 100644
+--- a/src/video_core/renderer_opengl/gl_driver.cpp
++++ b/src/video_core/renderer_opengl/gl_driver.cpp
+@@ -178,6 +178,11 @@ void Driver::CheckExtensionSupport() {
+     intel_fragment_shader_ordering = GLAD_GL_INTEL_fragment_shader_ordering;
+     blend_minmax_factor = GLAD_GL_AMD_blend_minmax_factor || GLAD_GL_NV_blend_minmax_factor;
+     is_suitable = GLAD_GL_VERSION_4_3 || GLAD_GL_ES_VERSION_3_2;
++#ifdef __EMSCRIPTEN__
++    // WebGL2 is OpenGL ES 3.0 level. The renderer avoids the ES 3.1/3.2
++    // features it otherwise relies on when built for the web.
++    is_suitable = is_suitable || GLAD_GL_ES_VERSION_3_0;
++#endif
+ }
+ 
+ void Driver::FindBugs() {
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
+index 8f022132d..74875c333 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
+@@ -15,6 +15,12 @@ namespace OpenGL {
+ 
+ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug_name) {
+     std::string preamble;
++#ifdef __EMSCRIPTEN__
++    // WebGL2 only accepts GLSL ES 3.00
++    if (GLES) {
++        preamble = "#version 300 es\n";
++    } else
++#endif
+     if (GLES) {
+         preamble = R"(#version 320 es
+ 

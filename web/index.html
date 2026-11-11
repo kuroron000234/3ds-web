@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3DS-web</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 16px; }
+  canvas { display: block; width: 100%; max-width: 800px; background: #000; image-rendering: pixelated; }
+  #log { height: 220px; overflow: auto; background: #000; padding: 8px; font: 12px/1.4 monospace; white-space: pre-wrap; }
+  .row { margin: 12px 0; }
+</style>
+</head>
+<body>
+<main>
+  <div class="row">
+    <label>ROM を選択（自分で吸い出したもの）: <input type="file" id="rom" disabled></label>
+    <span id="status">読み込み中…</span>
+  </div>
+  <canvas id="canvas" width="400" height="480"></canvas>
+  <div class="row" id="log"></div>
+</main>
+<script>
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  const romEl = document.getElementById('rom');
+
+  function log(text) {
+    logEl.textContent += text + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  if (!self.crossOriginIsolated) {
+    log('警告: crossOriginIsolated が無効です。COOP/COEP ヘッダ付きで配信してください。');
+  }
+
+  var Module = {
+    canvas: document.getElementById('canvas'),
+    print: log,
+    printErr: log,
+    preRun: [() => {
+      for (const dir of ['/azahar', '/azahar/system', '/azahar/save', '/roms']) {
+        Module.FS.mkdir(dir);
+      }
+    }],
+    onRuntimeInitialized: () => {
+      statusEl.textContent = '準備完了';
+      romEl.disabled = false;
+      window.__ready = true;
+    },
+    onAbort: (what) => { statusEl.textContent = '異常終了: ' + what; },
+  };
+
+  romEl.addEventListener('change', async () => {
+    const file = romEl.files[0];
+    if (!file) return;
+    statusEl.textContent = '読み込み中: ' + file.name;
+    // TODO: 大きな ROM は丸ごとメモリに載せず、OPFS か WORKERFS で読む
+    const data = new Uint8Array(await file.arrayBuffer());
+    const path = '/roms/' + file.name;
+    Module.FS.writeFile(path, data);
+    const ok = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
+    statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗';
+  });
+</script>
+<script src="azahar_web.js"></script>
+</body>
+</html>
