@@ -2,7 +2,7 @@
 # ビルドをラップトップ（Tailscale 経由、~/.ssh/config の Host laptop）で行う補助スクリプト。
 # Cloud Shell は 2 コアで /tmp も再起動で消えるため、重いビルドはこちらに任せる。
 #
-# 使い方: ./remote.sh sync    作業ツリーをラップトップへ送る
+# 使い方: ./remote.sh sync    パッチを取り直し、作業ツリーと Azahar の変更をラップトップへ送る
 #         ./remote.sh build   送ってからビルドし、ログを手元へ流す（終わるまで戻らない）
 #         ./remote.sh fetch   成果物（azahar_web.js / .wasm）を web/ へ持ち帰る
 #         ./remote.sh status  ラップトップ側のビルドの最終行を表示する
@@ -12,11 +12,47 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HOST="${REMOTE_HOST:-laptop}"
 RDIR="${REMOTE_DIR:-3ds-web-build}" # ラップトップのホームからの相対パス
 LOG_DIR=/tmp/3ds-remote             # 手元に流すログ（statusline.sh が読む）
+SRC="${WORK:-/tmp/3ds}/azahar"      # Cloud Shell 側で編集する Azahar のソース
+
+# Cloud Shell の Azahar への変更を patches/azahar.patch に書き出す。
+# ソースが消えている（再起動後）ときや差分が空のときは、既存のパッチを残す。
+save_patch() {
+    [ -d "$SRC/.git" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    git -C "$SRC" diff --ignore-submodules >"$tmp"
+    if [ -s "$tmp" ]; then
+        cmp -s "$tmp" "$HERE/patches/azahar.patch" || echo "パッチを更新: patches/azahar.patch"
+        mv "$tmp" "$HERE/patches/azahar.patch"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# Cloud Shell で変更した Azahar のファイルを、ラップトップの作業ツリーへ反映する
+sync_azahar() {
+    if [ ! -d "$SRC/.git" ]; then
+        echo "注意: $SRC が無いので Azahar の変更は送らない（./bootstrap.sh で作り直せる）"
+        return 0
+    fi
+    local files
+    files=$(
+        git -C "$SRC" diff --name-only --diff-filter=d --ignore-submodules
+        git -C "$SRC" ls-files --others --exclude-standard
+    )
+    printf '%s\n' "$files" >"$SRC/.sync-manifest"
+    # shellcheck disable=SC2086
+    (cd "$SRC" && tar -cf - .sync-manifest $files) |
+        ssh "$HOST" "bash $RDIR/repo/tools/apply-sync.sh \$HOME/$RDIR/work/azahar"
+    rm -f "$SRC/.sync-manifest"
+}
 
 sync() {
+    save_patch
     # 削除したファイルは消えないが、ビルドに使うファイルは上書きされる
     tar -C "$HERE" --exclude=.git --exclude='web/azahar_web.*' -cf - . |
         ssh "$HOST" "mkdir -p $RDIR/repo && tar -C $RDIR/repo -xf -"
+    sync_azahar
 }
 
 build() {
