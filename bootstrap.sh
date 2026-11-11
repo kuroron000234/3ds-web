@@ -2,6 +2,8 @@
 # /tmp/3ds に作業環境を再構築する（Cloud Shell は $HOME 以外が消えるため）。
 # 使い方: ./bootstrap.sh          環境を作って CMake 構成まで行う
 #         ./bootstrap.sh build    続けてビルドする
+# 環境変数: WORK（作業場所）、FRONTEND_DIR（フロントエンドのソース）、OUT_DIR（成果物のコピー先）、
+#           NINJA_JOBS（並列数）、RECONFIGURE=1（CMake 構成をやり直す）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -48,6 +50,8 @@ if command -v ccache >/dev/null; then
     export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache-3ds}"
     export CCACHE_COMPILERCHECK="string:emsdk-$EMSDK_VERSION"
     export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-800M}"
+    # 作業場所が違っても（エージェントごとのツリーでも）キャッシュが当たるよう、パスを相対化する
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$WORK}"
 fi
 
 mkdir -p build
@@ -55,19 +59,23 @@ cd build
 # -pthread: boost.asio とエミュレーター本体がスレッド必須 / -fwasm-exceptions: 例外を使う
 # -Wno-c++11-narrowing: wasm32 は size_t が 32bit で、u64 からの縮小がエラーになる
 FLAGS="-pthread -fwasm-exceptions -msimd128 -Wno-c++11-narrowing"
+# 構成済みなら飛ばす（CMakeLists.txt の変更は ninja が自分で検知して構成し直す）
+if [ ! -f build.ninja ] || [ "${RECONFIGURE:-}" = 1 ]; then
 emcmake cmake ../azahar -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
     -DROBIN_MAP_INCLUDE_DIR="$WORK/deps/robin-map/include" \
-    -DWEB_FRONTEND_DIR="$HERE/frontend" \
+    -DWEB_FRONTEND_DIR="${FRONTEND_DIR:-$HERE/frontend}" \
     -DENABLE_LIBRETRO=ON -DENABLE_QT=OFF -DENABLE_SDL2=OFF -DENABLE_TESTS=OFF \
     -DENABLE_ROOM=OFF -DENABLE_WEB_SERVICE=OFF -DENABLE_SCRIPTING=OFF -DENABLE_GDBSTUB=OFF \
     -DENABLE_CUBEB=OFF -DENABLE_OPENAL=OFF -DENABLE_LIBUSB=OFF \
     -DENABLE_VULKAN=OFF -DENABLE_OPENGL=ON -DENABLE_SOFTWARE_RENDERER=ON \
     -DENABLE_LTO=OFF -DCITRA_USE_PRECOMPILED_HEADERS=OFF -DCITRA_WARNINGS_AS_ERRORS=OFF
+fi
 
 if [ "${1:-}" = build ]; then
-    ninja -k 0 azahar_web 2>&1 | tee "$WORK/build.log"
+    ninja -k 0 ${NINJA_JOBS:+-j "$NINJA_JOBS"} azahar_web 2>&1 | tee "$WORK/build.log"
     command -v ccache >/dev/null && ccache --show-stats | head -8
     # /tmp は Cloud Shell の再起動で消えるので、成果物を Home 側にも残す
-    cp bin/Release/azahar_web.js bin/Release/azahar_web.wasm "$HERE/web/"
+    mkdir -p "${OUT_DIR:-$HERE/web}"
+    cp bin/Release/azahar_web.js bin/Release/azahar_web.wasm "${OUT_DIR:-$HERE/web}/"
 fi

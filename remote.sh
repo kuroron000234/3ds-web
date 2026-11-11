@@ -12,7 +12,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HOST="${REMOTE_HOST:-laptop}"
 RDIR="${REMOTE_DIR:-3ds-web-build}" # ラップトップのホームからの相対パス
 LOG_DIR=/tmp/3ds-remote             # 手元に流すログ（statusline.sh が読む）
-SRC="${WORK:-/tmp/3ds}/azahar"      # Cloud Shell 側で編集する Azahar のソース
+SRC="${WORK:-/tmp/3ds}/azahar"      # Cloud Shell 側で編集する Azahar のソース（統合ブランチ web）
+# 差分の基準は上流の固定リビジョン（ブランチ web のコミットも未コミットの変更も含めるため）
+BASE_REV=$(sed -n 's/^AZAHAR_REV=//p' "$HERE/bootstrap.sh")
 
 # Cloud Shell の Azahar への変更を patches/azahar.patch に書き出す。
 # ソースが消えている（再起動後）ときや差分が空のときは、既存のパッチを残す。
@@ -20,7 +22,7 @@ save_patch() {
     [ -d "$SRC/.git" ] || return 0
     local tmp
     tmp=$(mktemp)
-    git -C "$SRC" diff --ignore-submodules >"$tmp"
+    git -C "$SRC" diff --ignore-submodules "$BASE_REV" >"$tmp"
     if [ -s "$tmp" ]; then
         cmp -s "$tmp" "$HERE/patches/azahar.patch" || echo "パッチを更新: patches/azahar.patch"
         mv "$tmp" "$HERE/patches/azahar.patch"
@@ -37,7 +39,7 @@ sync_azahar() {
     fi
     local files
     files=$(
-        git -C "$SRC" diff --name-only --diff-filter=d --ignore-submodules
+        git -C "$SRC" diff --name-only --diff-filter=d --ignore-submodules "$BASE_REV"
         git -C "$SRC" ls-files --others --exclude-standard
     )
     printf '%s\n' "$files" >"$SRC/.sync-manifest"

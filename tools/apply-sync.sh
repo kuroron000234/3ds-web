@@ -21,7 +21,8 @@ while IFS= read -r f; do
     fi
 done <.sync-manifest
 
-# Cloud Shell 側で元に戻したファイルは、ラップトップ側でも元に戻す
+# Cloud Shell 側で元に戻したファイルは、ラップトップ側でも元に戻す（送り先が git のツリーのときだけ）
+[ -d "$DEST/.git" ] || [ -f "$DEST/.git" ] || exit 0
 git -C "$DEST" diff --name-only --ignore-submodules | while IFS= read -r f; do
     if ! grep -qxF "$f" .sync-manifest; then
         git -C "$DEST" checkout -q -- "$f"
