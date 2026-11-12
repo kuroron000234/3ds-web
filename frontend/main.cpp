@@ -73,8 +73,10 @@ std::map<std::string, std::string> options = {
     // WASM では dynarmic JIT が使えない
     {"citra_use_cpu_jit", "disabled"},
     {"citra_use_fastinterp", "enabled"},
-    // WebGL2 向けのレンダラー移植が済むまではソフトウェア描画を既定にする
-    {"citra_graphics_api", "Software"},
+    {"citra_graphics_api", "OpenGL"},
+    // WebGL2 にはジオメトリシェーダーが無い。頂点シェーダーへの組み込みが済むまで、
+    // 頂点処理は CPU（PICA シェーダーのインタプリタ）で行う
+    {"citra_use_hw_shader", "disabled"},
 };
 
 const char* GetVariable(const char* key) {
