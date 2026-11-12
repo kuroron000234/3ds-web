@@ -113,6 +113,12 @@ const char* const SYSTEM_DIR = "/azahar/system";
 const char* const SAVE_DIR = "/azahar/save";
 
 void LogPrintf(retro_log_level level, const char* fmt, ...) {
+    // コアはログのフィルタを Debug に固定していて、シェーダーのコンパイルやメモリの割り当てごとに
+    // 1 行出す。stderr への書き込みはメインスレッドへ同期で委譲される（終わるまで待つ）ので、
+    // 遊んでいる間に何千行も流すと遅くなる。デバッグログは捨てる
+    if (level < RETRO_LOG_INFO) {
+        return;
+    }
     static const char* const names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
     va_list args;
     va_start(args, fmt);

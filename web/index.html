@@ -55,16 +55,38 @@
   const romEl = document.getElementById('rom');
 
   let lastMessage = ''; // コアが画面表示用に出した直近のメッセージ（読み込み失敗の理由など）
+  // ログは直近 LOG_MAX 行だけを持ち、画面への反映は 1 フレームに 1 回にまとめる。
+  // エミュレーションスレッドの printf はメインスレッドの処理が終わるまで待たされるので、
+  // ここが重いとゲームが遅くなる（以前は textContent に足し続け、長く遊ぶほど遅くなっていた）
+  const LOG_MAX = 1000;
+  const ERROR_RE = /\[MSG\]|error|critical|abort|exception|assert|unreachable|warning|失敗|異常/i;
+  let logLines = [];
+  const errorLines = []; // コピー用。古いエラー行が流れて消えないよう別に持つ（直近 200 行）
+  let logDirty = false;
   function log(text) {
+    if (text.startsWith('[DEBUG]')) return; // 旧ビルドはコアのデバッグログも流してくる
     if (text.startsWith('[MSG] ')) lastMessage = text.slice(6).trim();
-    logEl.textContent += text + '\n';
-    logEl.scrollTop = logEl.scrollHeight;
+    logLines.push(text);
+    if (logLines.length > LOG_MAX * 2) logLines = logLines.slice(-LOG_MAX);
+    if (ERROR_RE.test(text) && !/FetchVariable/.test(text)) {
+      errorLines.push(text);
+      if (errorLines.length > 200) errorLines.shift();
+    }
+    if (!logDirty) {
+      logDirty = true;
+      requestAnimationFrame(() => {
+        logDirty = false;
+        logEl.textContent = logLines.slice(-LOG_MAX).join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+      });
+    }
   }
+  window.logText = () => logLines.join('\n'); // テスト用
 
   // 不具合の報告用: ログからエラーに関係する行（と末尾の数行）だけを取り出してコピーする
   document.getElementById('copylog').addEventListener('click', async (ev) => {
-    const lines = logEl.textContent.split('\n').filter(l => l);
-    const hits = lines.filter(l => /\[MSG\]|error|critical|abort|exception|assert|unreachable|warning|失敗|異常/i.test(l) && !/FetchVariable/.test(l));
+    const lines = logLines.filter(l => l);
+    const hits = errorLines;
     const text = ['状態: ' + statusEl.textContent, 'ROM: ' + (romEl.files[0] ? romEl.files[0].name.replace(/^.*(\.[^.]+)$/, '*$1') + ' ' + Math.round(romEl.files[0].size / 1048576) + 'MB' : 'なし'),
       '--- エラー行（最大 40）', ...[...new Set(hits)].slice(-40), '--- 末尾 10 行', ...lines.slice(-10)].join('\n');
     try { await navigator.clipboard.writeText(text); ev.target.textContent = 'コピーしました'; }
