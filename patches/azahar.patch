@@ -183,7 +183,7 @@ index 814863e52..282c30c60 100644
  
  if (CITRA_USE_PRECOMPILED_HEADERS)
 diff --git a/src/core/file_sys/ncch_container.cpp b/src/core/file_sys/ncch_container.cpp
-index bf4abb023..e1c83d199 100644
+index bf4abb023..3be846b8b 100644
 --- a/src/core/file_sys/ncch_container.cpp
 +++ b/src/core/file_sys/ncch_container.cpp
 @@ -258,7 +258,7 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
@@ -244,6 +244,26 @@ index bf4abb023..e1c83d199 100644
              // Encrypted NCCH are not supported
              return Loader::ResultStatus::ErrorEncrypted;
          }
+@@ -509,7 +542,18 @@ Loader::ResultStatus NCCHContainer::LoadSectionExeFS(const char* name, std::vect
+                     return Loader::ResultStatus::Error;
+ 
+                 // Decompress .code section...
+-                buffer.resize(LZSS_GetDecompressedSize(temp_buffer));
++                const std::size_t decompressed_size = LZSS_GetDecompressedSize(temp_buffer);
++                // A real .code never decompresses to more than a few dozen MiB. A huge size means
++                // the section is garbage, typically still encrypted in an incompletely decrypted
++                // dump. Fail cleanly instead of throwing std::length_error / std::bad_alloc.
++                if (decompressed_size < temp_buffer.size() || decompressed_size > 256 * 1024 * 1024) {
++                    LOG_ERROR(Service_FS,
++                              "ExeFS .code is corrupt (decompressed size {:#x}); the dump may be "
++                              "incompletely decrypted",
++                              decompressed_size);
++                    return Loader::ResultStatus::ErrorInvalidFormat;
++                }
++                buffer.resize(decompressed_size);
+                 if (!LZSS_Decompress(temp_buffer, buffer)) {
+                     return Loader::ResultStatus::ErrorInvalidFormat;
+                 }
 diff --git a/src/core/file_sys/ncch_container.h b/src/core/file_sys/ncch_container.h
 index 1ae7aadc9..9cb2fd056 100644
 --- a/src/core/file_sys/ncch_container.h

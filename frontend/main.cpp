@@ -557,8 +557,9 @@ void LoadGameOnEmuThread(void* arg) {
         if (gl_context == 0 && !CreateGLContext()) {
             return;
         }
-        if (hw_render.context_reset) {
-            hw_render.context_reset();
+        // Azahar はここ（context_reset）で実際にゲームを読み込む
+        if (hw_render.context_reset && !GuardCore("読み込み", hw_render.context_reset)) {
+            return;
         }
     }
 

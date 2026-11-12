@@ -56,6 +56,7 @@
   const romEl = document.getElementById('rom');
 
   let lastMessage = ''; // コアが画面表示用に出した直近のメッセージ（読み込み失敗の理由など）
+  let loadHint = ''; // 読み込み失敗の理由（日本語）。lastMessage より優先して表示する
   // ログは直近 LOG_MAX 行だけを持ち、画面への反映は 1 フレームに 1 回にまとめる。
   // エミュレーションスレッドの printf はメインスレッドの処理が終わるまで待たされるので、
   // ここが重いとゲームが遅くなる（以前は textContent に足し続け、長く遊ぶほど遅くなっていた）
@@ -67,6 +68,10 @@
   function log(text) {
     if (text.startsWith('[DEBUG]')) return; // 旧ビルドはコアのデバッグログも流してくる
     if (text.startsWith('[MSG] ')) lastMessage = text.slice(6).trim();
+    // コアの英語のエラーのうち、利用者が対処できるものは理由を日本語で添える
+    if (/ExeFS \.code is corrupt/.test(text)) {
+      loadHint = 'プログラム本体（.code）が壊れています。復号が不完全な吸い出しの可能性があります（GodMode9 などで吸い出し直してください）';
+    }
     logLines.push(text);
     if (logLines.length > LOG_MAX * 2) logLines = logLines.slice(-LOG_MAX);
     if (ERROR_RE.test(text) && !/FetchVariable/.test(text)) {
@@ -318,6 +323,7 @@
     if (!file) return;
     statusEl.textContent = '読み込み中: ' + file.name;
     lastMessage = '';
+    loadHint = '';
     // 本体の言語をブラウザの言語に合わせる（既定は英語。多言語対応のゲームの表示に効く）
     const LANGS = { ja: 'Japanese', fr: 'French', es: 'Spanish', de: 'German', it: 'Italian', nl: 'Dutch', pt: 'Portuguese', ru: 'Russian', ko: 'Korean', zh: 'Traditional Chinese' };
     const lang = LANGS[(navigator.language || 'en').slice(0, 2)];
@@ -341,7 +347,10 @@
         await new Promise(r => setTimeout(r, 50));
       }
     })(path);
-    statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗' + (lastMessage ? ': ' + lastMessage : '');
+    // コアは読み込みの本体（context_reset）が失敗してもメッセージを出すだけで戻ってくる
+    const failed = !ok || /fail|error|must be decrypted|not supported|例外|メモリが足りな/i.test(lastMessage);
+    const reason = loadHint || lastMessage;
+    statusEl.textContent = !failed ? '実行中: ' + file.name : '読み込み失敗' + (reason ? ': ' + reason : '');
   });
 
   // ---- 入力: 共有メモリ（frontend/main.cpp の input_state）へ書く ----
