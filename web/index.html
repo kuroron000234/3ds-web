@@ -11,6 +11,8 @@
   #keys { color: #999; font-size: 12px; }
   #log { height: 220px; overflow: auto; background: #000; padding: 8px; font: 12px/1.4 monospace; white-space: pre-wrap; }
   .row { margin: 12px 0; }
+  #gfx { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  #gpu { color: #999; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -20,6 +22,20 @@
     <span id="status">読み込み中…</span>
     <span id="speed"></span>
     <button id="copylog" type="button">エラーをコピー</button>
+  </div>
+  <div class="row" id="gfx">
+    <label>描画 <select id="api">
+      <option value="auto">自動</option>
+      <option value="OpenGL">GPU（WebGL2）</option>
+      <option value="Software">CPU（ソフトウェア描画）</option>
+    </select></label>
+    <label>解像度 <select id="scale">
+      <option value="1">1 倍（400×240）</option>
+      <option value="2">2 倍</option>
+      <option value="3">3 倍</option>
+      <option value="4">4 倍</option>
+    </select></label>
+    <span id="gpu"></span>
   </div>
   <canvas id="canvas" width="400" height="480"></canvas>
   <div class="row" id="keys">
@@ -106,6 +122,66 @@
   }
   window.mountRom = mountRom;
 
+  // ---- 描画方式と解像度 ----
+  // ブラウザの WebGL が GPU で動いているかを調べる。GPU が無い（または使えない）端末では
+  // ブラウザが CPU で WebGL を代行する（SwiftShader・llvmpipe など）ので、それを見分ける。
+  function detectGpu() {
+    const gl = document.createElement('canvas').getContext('webgl2', { powerPreference: 'high-performance' });
+    if (!gl) return { name: 'WebGL2 非対応', hardware: false, webgl2: false };
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    // CPU 代行のときは「性能に大きな問題がある」扱いになり、この指定で作れない
+    const strict = document.createElement('canvas').getContext('webgl2', { failIfMajorPerformanceCaveat: true });
+    strict?.getExtension('WEBGL_lose_context')?.loseContext();
+    const software = !strict || /swiftshader|llvmpipe|softpipe|lavapipe|software|basic render/i.test(name);
+    return { name, hardware: !software, webgl2: true };
+  }
+  const gpu = detectGpu();
+  const apiEl = document.getElementById('api');
+  const scaleEl = document.getElementById('scale');
+  const gpuEl = document.getElementById('gpu');
+  const store = {
+    get(k) { try { return localStorage.getItem('3ds-web.' + k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem('3ds-web.' + k, v); } catch {} },
+  };
+  apiEl.value = store.get('api') || 'auto';
+  scaleEl.value = store.get('scale') || '1';
+  if (!apiEl.value) apiEl.value = 'auto';
+  if (!scaleEl.value) scaleEl.value = '1';
+  if (!gpu.webgl2) apiEl.querySelector('option[value=OpenGL]').disabled = true;
+  // 自動: WebGL2 があれば常にそれを使う。CPU 代行の WebGL でもソフトウェア描画より速い
+  // （SwiftShader での実測: WebGL2 は実機比 35%、ソフトウェア描画は 4%）
+  const chosenApi = () => apiEl.value !== 'auto' && !(apiEl.value === 'OpenGL' && !gpu.webgl2)
+    ? apiEl.value : (gpu.webgl2 ? 'OpenGL' : 'Software');
+  // 解像度を上げられるのは本物の GPU で WebGL2 を使うときだけ（CPU 代行では遅くなるだけ。
+  // SwiftShader で 2 倍にすると 35% → 14%）。ソフトウェア描画は常に等倍
+  const canScale = () => chosenApi() === 'OpenGL' && gpu.hardware;
+  let gameStarted = false;
+  function updateGfxUi() {
+    const api = chosenApi();
+    scaleEl.disabled = !canScale();
+    gpuEl.textContent = (gpu.hardware ? 'GPU: ' : 'GPU なし（CPU で代行）: ') + gpu.name +
+      (!gpu.hardware && api === 'OpenGL' ? ' → 解像度は 1 倍に固定' : '') +
+      (!gpu.webgl2 ? ' → CPU で描画' : '') +
+      (gameStarted ? '（変更はページを再読み込みすると反映）' : '');
+  }
+  for (const el of [apiEl, scaleEl]) {
+    el.addEventListener('change', () => { store.set(el.id, el.value); updateGfxUi(); });
+  }
+  updateGfxUi();
+  log('WebGL: ' + gpu.name + (gpu.hardware ? '' : '（GPU ではなく CPU で動作）'));
+  // ROM の読み込み直前に呼ぶ（コアは読み込み時にだけ設定を読む）
+  function applyGraphics() {
+    const api = chosenApi();
+    const scale = canScale() ? scaleEl.value : '1';
+    Module.ccall('web_set_option', null, ['string', 'string'], ['citra_graphics_api', api]);
+    Module.ccall('web_set_option', null, ['string', 'string'], ['citra_resolution_factor', scale]);
+    log(`描画: ${api === 'OpenGL' ? 'GPU（WebGL2）' : 'CPU（ソフトウェア）'}、解像度 ${scale} 倍`);
+    gameStarted = true;
+    updateGfxUi();
+  }
+
   romEl.addEventListener('change', async () => {
     const file = romEl.files[0];
     if (!file) return;
@@ -115,6 +191,7 @@
     const LANGS = { ja: 'Japanese', fr: 'French', es: 'Spanish', de: 'German', it: 'Italian', nl: 'Dutch', pt: 'Portuguese', ru: 'Russian', ko: 'Korean', zh: 'Traditional Chinese' };
     const lang = LANGS[(navigator.language || 'en').slice(0, 2)];
     if (lang) Module.ccall('web_set_option', null, ['string', 'string'], ['citra_language_value', lang]);
+    applyGraphics();
     const path = '/roms/' + file.name;
     await mountRom(path, file);
     // 読み込みはエミュレーションスレッドで進む。メインスレッドは止めずに結果を待つ
