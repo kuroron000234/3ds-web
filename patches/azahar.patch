@@ -25,7 +25,7 @@ index e99de6a81..e1c6528b0 100644
  # Platform-specific library requirements
  # ======================================
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
-index e28f9941b..c14ba0722 100644
+index e28f9941b..8824bea1d 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
 @@ -99,3 +99,32 @@ else()
@@ -55,9 +55,9 @@ index e28f9941b..c14ba0722 100644
 +            # OffscreenCanvas (WebGL2 or 2D) so the browser main thread never blocks.
 +            -sOFFSCREENCANVAS_SUPPORT
 +            -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
-+            -sPTHREAD_POOL_SIZE=10 -sSTACK_SIZE=5242880
++            -sPTHREAD_POOL_SIZE=11 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
-+            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_input_ptr,_web_audio_ptr,_web_tick
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_input_ptr,_web_audio_ptr,_web_tick
 +            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap,HEAP32)
 +  endif()
 +endif()
@@ -76,6 +76,50 @@ index 307e14af6..95c985247 100644
  
      glDisable(GL_DITHER);
  
+diff --git a/src/common/file_util.cpp b/src/common/file_util.cpp
+index 652631d11..a43437ba8 100644
+--- a/src/common/file_util.cpp
++++ b/src/common/file_util.cpp
+@@ -1250,6 +1250,12 @@ std::string SanitizePath(std::string_view path_, DirectorySeparator directory_se
+     return std::string(RemoveTrailingSlash(path));
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Implemented by the web frontend (3ds-web frontend/main.cpp).
++extern "C" std::FILE* web_rom_fopen(const char* path);
++extern "C" int64_t web_rom_pread(std::FILE* file, void* data, uint64_t count, uint64_t offset);
++#endif
++
+ IOFile::IOFile() = default;
+ 
+ IOFile::IOFile(const std::string& filename, const char openmode[], int flags)
+@@ -1397,7 +1403,13 @@ bool IOFile::Open() {
+     }
+     m_good = m_file != nullptr;
+ #else
+-    m_file = FOPEN(filename.c_str(), openmode.c_str());
++#ifdef __EMSCRIPTEN__
++    // The web frontend serves the ROM straight from the browser's File object instead of
++    // copying it into the in-memory file system.
++    m_file = web_rom_fopen(filename.c_str());
++    if (m_file == nullptr)
++#endif
++        m_file = FOPEN(filename.c_str(), openmode.c_str());
+     m_good = m_file != nullptr;
+ #endif
+ 
+@@ -1516,6 +1528,11 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
+     FSEEK(m_file, pos, RETRO_VFS_SEEK_POSITION_START);
+     read = static_cast<std::size_t>(rv);
+ #else
++#ifdef __EMSCRIPTEN__
++    if (const s64 rv = web_rom_pread(m_file, data, byte_count, offset); rv != -2) {
++        return rv < 0 ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(rv);
++    }
++#endif
+     read = pread(fileno(m_file), data, byte_count, offset);
+ #endif
+     if (read != byte_count) {
 diff --git a/src/common/hash.h b/src/common/hash.h
 index c08e4b2a0..119a196d4 100644
 --- a/src/common/hash.h

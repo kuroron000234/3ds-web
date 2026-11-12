@@ -101,8 +101,9 @@ try {
         const i = kv.indexOf('=');
         Module.ccall('web_set_option', null, ['string', 'string'], [kv.slice(0, i), kv.slice(i + 1)]);
       }
-      const buf = new Uint8Array(await (await fetch('/' + rom)).arrayBuffer());
-      Module.FS.writeFile('/roms/' + rom, buf);
+      const blob = await (await fetch('/' + rom)).blob();
+      if (window.mountRom) await window.mountRom('/roms/' + rom, new File([blob], rom));
+      else Module.FS.writeFile('/roms/' + rom, new Uint8Array(await blob.arrayBuffer()));
       const t = performance.now();
       out.loaded = await (async (path) => {
       const started = Module.ccall('web_load_game', 'boolean', ['string'], [path]);

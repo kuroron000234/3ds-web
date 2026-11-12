@@ -18,8 +18,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <list>
 #include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
@@ -66,6 +70,35 @@ EM_JS(void, ScheduleTick, (double delay), {
     if (delay <= 0) s.ch.port2.postMessage(0);
     else setTimeout(s.run, delay);
 });
+
+// ROM 読み込みスレッドの準備: メインスレッドが BroadcastChannel で送ってくる File を受け取る。
+// File はメモリに載せず、読むときに必要な範囲だけ FileReaderSync で取り出す。
+EM_JS(void, RomChannelInit, (), {
+    Module.__roms = {};
+    const ch = Module.__romChannel = new BroadcastChannel('3ds-web-rom');
+    ch.onmessage = (e) => {
+        const m = e.data;
+        if (m && m.file && m.id) {
+            Module.__roms[m.id] = m.file;
+            ch.postMessage({ack: m.id});
+        }
+    };
+});
+
+// ROM 読み込みスレッドで実行: File の [offset, offset+length) を dst へ読む。読めた長さか -1。
+EM_JS(int, RomReadRange, (int id, double offset, void* dst, int length), {
+    try {
+        const file = Module.__roms[id];
+        if (!file) return -1;
+        const reader = Module.__romReader || (Module.__romReader = new FileReaderSync());
+        const bytes = new Uint8Array(reader.readAsArrayBuffer(file.slice(offset, offset + length)));
+        HEAPU8.set(bytes, dst);
+        return bytes.length;
+    } catch (e) {
+        err('ROM を読めません: ' + e);
+        return -1;
+    }
+});
 // clang-format on
 
 namespace {
@@ -86,6 +119,143 @@ void LogPrintf(retro_log_level level, const char* fmt, ...) {
     std::fprintf(stderr, "[%s] ", names[level <= RETRO_LOG_ERROR ? level : RETRO_LOG_ERROR]);
     std::vfprintf(stderr, fmt, args);
     va_end(args);
+}
+
+// ---- ROM の仮想ファイル: ROM だけはブラウザの File から直接読む ----
+// Emscripten の仮想ファイルシステムに載せると ROM 全体がメモリに乗り、2GB 前後で読めなくなる。
+// そこで JS が web_mount_rom で登録したパスを Azahar が開くとき（common/file_util.cpp の
+// IOFile が web_rom_fopen / web_rom_pread を呼ぶ）、読み込みを ROM 読み込みスレッド
+// （FileReaderSync が使えるワーカー）へ委譲する。ブロック単位でキャッシュするので、細かい
+// 読み込みは委譲しない。それ以外のパス（セーブデータなど）は通常の stdio のまま。
+pthread_t rom_thread{};
+
+constexpr uint32_t ROM_BLOCK = 256 * 1024;
+constexpr size_t ROM_CACHE_BLOCKS = 96; // 24MB
+
+struct RomSource {
+    int id;
+    uint64_t size;
+};
+
+struct RomHandle {
+    std::string path;
+    RomSource source;
+    uint64_t pos = 0;
+};
+
+struct RomBlock {
+    uint64_t key; // (id << 40) | ブロック番号
+    std::vector<uint8_t> data;
+};
+
+std::mutex rom_mutex; // 以下すべてを守る（読み込みも直列にする）
+std::map<std::string, RomSource> rom_sources;
+std::list<RomBlock> rom_cache; // 先頭が最近使ったもの
+std::unordered_map<uint64_t, std::list<RomBlock>::iterator> rom_cache_index;
+
+struct RomReadRequest {
+    int id;
+    double offset;
+    void* dst;
+    int length;
+    int result;
+};
+
+// rom_mutex を持った状態で呼ぶ。ブロックを返す（読めなければ nullptr）。
+const std::vector<uint8_t>* RomGetBlock(const RomSource& src, uint64_t block) {
+    const uint64_t key = (static_cast<uint64_t>(src.id) << 40) | block;
+    if (const auto it = rom_cache_index.find(key); it != rom_cache_index.end()) {
+        rom_cache.splice(rom_cache.begin(), rom_cache, it->second);
+        return &it->second->data;
+    }
+    const uint64_t offset = block * ROM_BLOCK;
+    const uint64_t remain = src.size - offset;
+    RomBlock entry{key, std::vector<uint8_t>(remain < ROM_BLOCK ? remain : ROM_BLOCK)};
+    RomReadRequest req{src.id, static_cast<double>(offset), entry.data.data(),
+                       static_cast<int>(entry.data.size()), -1};
+    const auto run = [](void* arg) {
+        auto* r = static_cast<RomReadRequest*>(arg);
+        r->result = RomReadRange(r->id, r->offset, r->dst, r->length);
+    };
+    if (pthread_equal(pthread_self(), rom_thread)) {
+        run(&req);
+    } else if (!emscripten_proxy_sync(emscripten_proxy_get_system_queue(), rom_thread, run, &req)) {
+        return nullptr;
+    }
+    if (req.result != static_cast<int>(entry.data.size())) {
+        return nullptr;
+    }
+    if (rom_cache.size() >= ROM_CACHE_BLOCKS) {
+        rom_cache_index.erase(rom_cache.back().key);
+        rom_cache.pop_back();
+    }
+    rom_cache.push_front(std::move(entry));
+    rom_cache_index[key] = rom_cache.begin();
+    return &rom_cache.front().data;
+}
+
+// rom_mutex を持った状態で呼ぶ。pos から len バイトを読む。読めた長さか -1。
+int64_t RomReadAt(const RomSource& src, uint64_t pos, void* out, uint64_t len) {
+    auto* dst = static_cast<uint8_t*>(out);
+    uint64_t done = 0;
+    while (done < len && pos < src.size) {
+        const uint32_t in_block = static_cast<uint32_t>(pos % ROM_BLOCK);
+        const auto* data = RomGetBlock(src, pos / ROM_BLOCK);
+        if (!data) {
+            return done ? static_cast<int64_t>(done) : -1;
+        }
+        uint64_t n = data->size() - in_block;
+        if (n > len - done) {
+            n = len - done;
+        }
+        std::memcpy(dst + done, data->data() + in_block, n);
+        done += n;
+        pos += n;
+    }
+    return static_cast<int64_t>(done);
+}
+
+// fopencookie 用のコールバック（stdio が FILE* の読み込み・シークをここへ回す）
+ssize_t CookieRead(void* cookie, char* buf, size_t size) {
+    auto* rom = static_cast<RomHandle*>(cookie);
+    std::scoped_lock lock(rom_mutex);
+    const int64_t n = RomReadAt(rom->source, rom->pos, buf, size);
+    if (n > 0) {
+        rom->pos += static_cast<uint64_t>(n);
+    }
+    return static_cast<ssize_t>(n);
+}
+
+int CookieSeek(void* cookie, off_t* offset, int whence) {
+    auto* rom = static_cast<RomHandle*>(cookie);
+    int64_t base = 0;
+    if (whence == SEEK_CUR) {
+        base = static_cast<int64_t>(rom->pos);
+    } else if (whence == SEEK_END) {
+        base = static_cast<int64_t>(rom->source.size);
+    }
+    if (base + *offset < 0) {
+        return -1;
+    }
+    rom->pos = static_cast<uint64_t>(base + *offset);
+    *offset = static_cast<off_t>(rom->pos);
+    return 0;
+}
+
+std::map<std::FILE*, RomHandle*> rom_files; // rom_mutex で守る
+
+int CookieClose(void* cookie) {
+    auto* rom = static_cast<RomHandle*>(cookie);
+    std::scoped_lock lock(rom_mutex);
+    std::erase_if(rom_files, [rom](const auto& kv) { return kv.second == rom; });
+    delete rom;
+    return 0;
+}
+
+void* RomThreadMain(void*) {
+    RomChannelInit();
+    // イベントループへ戻って待つ（File の受け取りと、委譲されてくる読み込みを処理する）
+    emscripten_exit_with_live_runtime();
 }
 
 uintptr_t GetCurrentFramebuffer() {
@@ -501,6 +671,47 @@ EMSCRIPTEN_KEEPALIVE bool web_load_game(const char* path) {
     return queued;
 }
 
+// JS から呼ぶ: ブラウザの File を仮想パスに結び付ける。id は BroadcastChannel '3ds-web-rom' で
+// ROM 読み込みスレッドへ送った File の番号（ack を受け取ってから呼ぶ）。size は File のバイト数。
+EMSCRIPTEN_KEEPALIVE void web_mount_rom(const char* path, int id, double size) {
+    std::scoped_lock lock(rom_mutex);
+    rom_sources[path] = RomSource{id, static_cast<uint64_t>(size)};
+}
+
+// Azahar（IOFile::Open）から呼ばれる: path が登録済みの ROM なら、それを読む FILE* を返す。
+// ROM でなければ nullptr（呼び出し側が通常の fopen に進む）。
+EMSCRIPTEN_KEEPALIVE std::FILE* web_rom_fopen(const char* path) {
+    RomHandle* rom = nullptr;
+    {
+        std::scoped_lock lock(rom_mutex);
+        const auto it = rom_sources.find(path);
+        if (it == rom_sources.end()) {
+            return nullptr;
+        }
+        rom = new RomHandle{path, it->second};
+    }
+    std::FILE* f = fopencookie(rom, "rb", {CookieRead, nullptr, CookieSeek, CookieClose});
+    if (!f) {
+        delete rom;
+        return nullptr;
+    }
+    std::scoped_lock lock(rom_mutex);
+    rom_files[f] = rom;
+    return f;
+}
+
+// Azahar（IOFile::ReadAtImpl）から呼ばれる: ファイル位置を動かさずに offset から読む。
+// f が ROM の FILE* でなければ -2、読めなければ -1。
+EMSCRIPTEN_KEEPALIVE int64_t web_rom_pread(std::FILE* f, void* data, uint64_t count,
+                                           uint64_t offset) {
+    std::scoped_lock lock(rom_mutex);
+    const auto it = rom_files.find(f);
+    if (it == rom_files.end()) {
+        return -2;
+    }
+    return RomReadAt(it->second->source, offset, data, count);
+}
+
 // JS から呼ぶ: 読み込みの状態。0 未開始、1 読み込み中、2 成功、3 失敗。
 EMSCRIPTEN_KEEPALIVE int web_load_state() {
     return load_state.load();
@@ -518,6 +729,9 @@ int main() {
     emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
     const int err = pthread_create(&emu_thread, &attr, EmuThreadMain, nullptr);
     pthread_attr_destroy(&attr);
+    if (pthread_create(&rom_thread, nullptr, RomThreadMain, nullptr) != 0) {
+        std::fprintf(stderr, "ROM 読み込みスレッドを作成できません\n");
+    }
     if (err != 0) {
         std::fprintf(stderr, "エミュレーションスレッドを作成できません (%d)\n", err);
         return 1;
