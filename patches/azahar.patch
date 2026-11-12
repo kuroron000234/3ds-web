@@ -258,6 +258,121 @@ index 1ae7aadc9..9cb2fd056 100644
      /**
       * Reads an application ExeFS section of an NCCH file (e.g. .code, .logo, etc.)
       * @param name Name of section to read out of NCCH file
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index 40ab7c57c..c568aa7bb 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -2,6 +2,10 @@
+ // Licensed under GPLv3 or any later version
+ // Refer to the LICENSE.txt file included.
+ 
++#include <array>
++#include <cstring>
++#include <map>
++#include <set>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/vector.hpp>
+ #include "common/archives.h"
+@@ -208,6 +212,84 @@ static u32 DecompressLZ11(const u8* in, u8* out) {
+     return decompressed_size;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// The bundled open source replacement for the standard shared font contains the glyphs for
++// 21 characters ("\u3093", "\u30F6", "~", "\uFF5E", and others) but leaves them out of its
++// character map, so games draw the fallback "?" in their place. Add the missing entries to
++// the (final, scan-type) CMAP section. Fonts that already map these characters or use the
++// glyph slots (such as a font dumped from a console) are left untouched.
++// Returns the new size of the font.
++static u32 RepairOpenSourceFontMap(u8* font, u32 size, u32 capacity) {
++    static constexpr std::array<std::pair<u16, u16>, 21> missing{{
++        {0x007E, 94},   {0x0107, 198},  {0x0192, 278},  {0x03CE, 372},  {0x0451, 438},
++        {0x3093, 724},  {0x30F6, 814},  {0x4F01, 970},  {0x5217, 1266}, {0x5384, 1419},
++        {0x5451, 1508}, {0x5C55, 2121}, {0x5F41, 2364}, {0x624E, 2675}, {0x6759, 3122},
++        {0x7594, 4213}, {0x8CED, 6033}, {0x9091, 6317}, {0x96EB, 6679}, {0xE07E, 7337},
++        {0xFF5E, 7431},
++    }};
++    const auto rd16 = [&](u32 o) { return static_cast<u16>(font[o] | font[o + 1] << 8); };
++    const auto rd32 = [&](u32 o) { return static_cast<u32>(rd16(o) | rd16(o + 2) << 16); };
++    const auto wr16 = [&](u32 o, u16 v) {
++        font[o] = static_cast<u8>(v);
++        font[o + 1] = static_cast<u8>(v >> 8);
++    };
++    const auto wr32 = [&](u32 o, u32 v) {
++        wr16(o, static_cast<u16>(v));
++        wr16(o + 2, static_cast<u16>(v >> 16));
++    };
++
++    constexpr u32 finf = 0x14;
++    if (size < 0x40 || std::memcmp(font + finf, "FINF", 4) != 0) {
++        return size;
++    }
++    const u32 map_data = rd32(finf + 0x18); // points past the section header
++    if (map_data < 8 || map_data + 0x10 > size) {
++        return size;
++    }
++    const u32 cmap = map_data - 8;
++    const u32 section_size = rd32(cmap + 4);
++    const u32 pairs = cmap + 0x16;
++    const u32 count = rd16(cmap + 0x14);
++    // Only a single scan-type map that ends the file can be extended in place
++    if (std::memcmp(font + cmap, "CMAP", 4) != 0 || rd16(cmap + 0xC) != 2 ||
++        rd32(cmap + 0x10) != 0 || cmap + section_size != size ||
++        pairs + count * 4 != size) {
++        return size;
++    }
++
++    std::map<u16, u16> map; // code -> glyph index
++    std::set<u16> used;
++    for (u32 i = 0; i < count; ++i) {
++        const u16 index = rd16(pairs + i * 4 + 2);
++        map[rd16(pairs + i * 4)] = index;
++        used.insert(index);
++    }
++    u32 added = 0;
++    for (const auto& [code, index] : missing) {
++        if (!map.contains(code) && !used.contains(index) && used.contains(index - 1)) {
++            map[code] = index;
++            ++added;
++        }
++    }
++    if (added == 0 || size + added * 4 > capacity || map.size() > 0xFFFF) {
++        return size;
++    }
++
++    wr16(cmap + 0x14, static_cast<u16>(map.size()));
++    u32 o = pairs;
++    for (const auto& [code, index] : map) {
++        wr16(o, code);
++        wr16(o + 2, index);
++        o += 4;
++    }
++    wr32(cmap + 4, section_size + added * 4);
++    wr32(0xC, o); // file size in the CFNT header
++    LOG_INFO(Service_APT, "Added {} missing characters to the shared font's character map",
++             added);
++    return o;
++}
++#endif
++
+ bool Module::LoadSharedFont() {
+     auto cfg = Service::CFG::GetModule(system);
+     u8 font_region_code;
+@@ -269,6 +351,14 @@ bool Module::LoadSharedFont() {
+     shared_font_header.region = font_region_code;
+     shared_font_header.decompressed_size =
+         DecompressLZ11(font_file.Data(), shared_font_mem->GetPointer(0x80));
++#ifdef __EMSCRIPTEN__
++    if (font_region_code == 1) {
++        shared_font_header.decompressed_size =
++            RepairOpenSourceFontMap(shared_font_mem->GetPointer(0x80),
++                                    shared_font_header.decompressed_size,
++                                    static_cast<u32>(shared_font_mem->GetSize()) - 0x80);
++    }
++#endif
+     std::memcpy(shared_font_mem->GetPointer(), &shared_font_header, sizeof(shared_font_header));
+     *shared_font_mem->GetPointer(0x83) = 'U'; // Change the magic from "CFNT" to "CFNU"
+ 
 diff --git a/src/core/nus_download.cpp b/src/core/nus_download.cpp
 index 28442a8d7..5d18f98db 100644
 --- a/src/core/nus_download.cpp
