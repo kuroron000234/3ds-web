@@ -25,10 +25,10 @@ index e99de6a81..e1c6528b0 100644
  # Platform-specific library requirements
  # ======================================
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
-index e28f9941b..b2aed11eb 100644
+index e28f9941b..c14ba0722 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
-@@ -99,3 +99,29 @@ else()
+@@ -99,3 +99,32 @@ else()
  endif()
  
  add_custom_target(azahar_libretro DEPENDS citra_libretro)
@@ -51,11 +51,14 @@ index e28f9941b..b2aed11eb 100644
 +    target_link_options(azahar_web PRIVATE
 +            -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3
 +            -sGL_ENABLE_GET_PROC_ADDRESS
++            # The frontend runs the core on its own pthread, which owns the canvas as an
++            # OffscreenCanvas (WebGL2 or 2D) so the browser main thread never blocks.
++            -sOFFSCREENCANVAS_SUPPORT
 +            -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
-+            -sPTHREAD_POOL_SIZE=8 -sSTACK_SIZE=5242880
++            -sPTHREAD_POOL_SIZE=10 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
-+            -sEXPORTED_FUNCTIONS=_main,_web_load_game
-+            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap)
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_input_ptr,_web_audio_ptr,_web_tick
++            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap,HEAP32)
 +  endif()
 +endif()
 diff --git a/src/citra_libretro/emu_window/libretro_window.cpp b/src/citra_libretro/emu_window/libretro_window.cpp
@@ -515,7 +518,7 @@ index 542d6a5e4..a3c45cfab 100644
      bool IsSuitable() const {
          return is_suitable;
 diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
-index 4cc7777f3..381f95e59 100644
+index 4cc7777f3..5d901595d 100644
 --- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
 +++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
 @@ -35,6 +35,29 @@ constexpr std::size_t INDEX_BUFFER_SIZE = 2_MiB;
@@ -654,7 +657,20 @@ index 4cc7777f3..381f95e59 100644
          std::memcpy(buffer_ptr, index_data, index_buffer_size);
          index_buffer.Unmap(index_buffer_size);
  
-@@ -684,7 +759,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+@@ -579,6 +654,12 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+         (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
+          (has_stencil && state.stencil.test_enabled));
+ 
++    if (shadow_rendering && driver.IsWebGL()) {
++        // WebGL2 has no image load/store to build the shadow map; skip the draw (shadow
++        // textures read as fully lit there).
++        return true;
++    }
++
+     const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
+     const Framebuffer* framebuffer = fb_helper.Framebuffer();
+     if (!framebuffer->color_id && framebuffer->shadow_rendering) {
+@@ -684,7 +765,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
  
      vertex_batch.clear();
  
@@ -663,7 +679,7 @@ index 4cc7777f3..381f95e59 100644
          glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                          GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
      }
-@@ -921,6 +996,87 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
+@@ -921,6 +1002,87 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
      return true;
  }
  
@@ -751,7 +767,7 @@ index 4cc7777f3..381f95e59 100644
  void RasterizerOpenGL::SyncAndUploadLUTsLF() {
      constexpr std::size_t max_size =
          sizeof(Common::Vec2f) * 256 * Pica::LightingRegs::NumLightingSampler +
-@@ -1043,6 +1199,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
+@@ -1043,6 +1205,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
  
      texture_buffer.Unmap(bytes_used);
  }
@@ -832,7 +848,7 @@ index 3dae1fd1f..c396966da 100644
          return {};
  
 diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
-index 411b7624c..5d58c1013 100644
+index 411b7624c..54993d369 100644
 --- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
 +++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
 @@ -44,6 +44,10 @@ static u64 GetUniqueIdentifier(const Pica::RegsInternal& regs, const ProgramCode
@@ -846,16 +862,30 @@ index 411b7624c..5d58c1013 100644
  
      if (supported_formats.find(dump.binary_format) == supported_formats.end()) {
          LOG_INFO(Render_OpenGL, "Precompiled cache entry with unsupported format - removing");
-@@ -272,7 +276,7 @@ public:
+@@ -271,8 +275,8 @@ public:
+         profile = Pica::Shader::Profile{
              .has_separable_shaders = separable,
              .has_clip_planes = driver.HasClipCullDistance(),
-             .has_geometry_shader = true,
+-            .has_geometry_shader = true,
 -            .has_custom_border_color = true,
++            .has_geometry_shader = !driver.IsWebGL(),
 +            .has_custom_border_color = !driver.IsWebGL(),
              .has_fragment_shader_interlock = driver.HasArbFragmentShaderInterlock(),
              // TODO: This extension requires GLSL 450 / OpenGL 4.5 context.
              .has_fragment_shader_barycentric = false,
-@@ -351,7 +355,15 @@ ShaderProgramManager::ShaderProgramManager(Frontend::EmuWindow& emu_window_, con
+@@ -335,7 +339,10 @@ public:
+ 
+         // Enable the geometry-shader only if we are actually doing per-fragment lighting
+         // and care about proper quaternions. Otherwise just use standard vertex+fragment shaders.
+-        const bool use_geometry_shader = !config.state.lighting_disable;
++        // WebGL2 has no geometry shaders: the vertex shader does the fixed geometry shader's
++        // attribute mapping itself (see GenerateVertexShader).
++        const bool use_geometry_shader =
++            profile.has_geometry_shader && !config.state.lighting_disable;
+ 
+         res.use_clip_planes = profile.has_clip_planes;
+         res.use_geometry_shader = use_geometry_shader;
+@@ -351,7 +358,15 @@ ShaderProgramManager::ShaderProgramManager(Frontend::EmuWindow& emu_window_, con
                                             u64 title_id, bool separable)
      : emu_window{emu_window_}, driver{driver_},
        strict_context_required{emu_window.StrictContextRequired()},
@@ -872,6 +902,18 @@ index 411b7624c..5d58c1013 100644
  
  ShaderProgramManager::~ShaderProgramManager() = default;
  
+@@ -390,6 +405,11 @@ void ShaderProgramManager::UseTrivialVertexShader() {
+ }
+ 
+ void ShaderProgramManager::UseFixedGeometryShader(const Pica::RegsInternal& regs) {
++    if (!impl->profile.has_geometry_shader) {
++        // Never create GL_GEOMETRY_SHADER objects on WebGL2.
++        UseTrivialGeometryShader();
++        return;
++    }
+     PicaFixedGSConfig gs_config(regs);
+     ExtraFixedGSConfig extra{
+         .use_clip_planes = driver.HasClipCullDistance(),
 diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
 index 8f022132d..debf03cfa 100644
 --- a/src/video_core/renderer_opengl/gl_shader_util.cpp
@@ -1669,7 +1711,7 @@ index 8244a83fa..181c7392c 100644
  
  void RendererOpenGL::ConfigureFramebufferTexture(TextureInfo& texture,
 diff --git a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
-index 972a248ec..8d7f9a943 100644
+index 972a248ec..b66dccef2 100644
 --- a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
 +++ b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
 @@ -36,19 +36,45 @@ static bool IsPassThroughTevStage(const Pica::TexturingRegs::TevStageConfig& sta
@@ -1722,7 +1764,33 @@ index 972a248ec..8d7f9a943 100644
  #endif // GL_FRAGMENT_PRECISION_HIGH
  #endif
  )";
-@@ -823,7 +849,7 @@ void FragmentModule::WriteFog() {
+@@ -101,6 +127,15 @@ layout (binding = 2, std140) uniform fs_data {
+ };
+ )";
+ 
++#ifdef __EMSCRIPTEN__
++// WebGL2 (GLSL ES 3.00) has no image load/store, so shadow rendering and shadow texture
++// sampling are stubbed out, and without gl_ClipDistance the clip planes are emulated with
++// a varying from the vertex shader and a discard here.
++static constexpr bool WebGL2 = true;
++#else
++static constexpr bool WebGL2 = false;
++#endif
++
+ FragmentModule::FragmentModule(const FSConfig& config_, const UserConfig& user_,
+                                const Profile& profile_)
+     : config{config_}, user{user_}, profile{profile_} {
+@@ -133,6 +168,9 @@ vec4 rounded_primary_color = byteround(primary_color);
+ vec4 primary_fragment_color = vec4(0.0);
+ vec4 secondary_fragment_color = vec4(0.0);
+ )";
++    if (WebGL2 && !profile.is_vulkan && !profile.has_clip_planes) {
++        out += "if (clip_dist.x < 0.0 || clip_dist.y < 0.0) discard;\n";
++    }
+ 
+     // Do not do any sort of processing if it's obvious we're not going to pass the alpha test
+     if (config.framebuffer.alpha_test_func == FramebufferRegs::CompareFunc::Never) {
+@@ -823,7 +861,7 @@ void FragmentModule::WriteFog() {
      // Generate clamped fog factor from LUT for given fog index
      out += "float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n"
             "float fog_f = fog_index - fog_i;\n"
@@ -1731,7 +1799,19 @@ index 972a248ec..8d7f9a943 100644
             "fog_lut_offset).rg;\n"
             "float fog_factor = fog_lut_entry.r + fog_lut_entry.g * fog_f;\n"
             "fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
-@@ -1053,7 +1079,7 @@ float ProcTexLookupLUT(int offset, float coord) {
+@@ -842,6 +880,11 @@ void FragmentModule::WriteGas() {
+ }
+ 
+ void FragmentModule::WriteShadow() {
++    if (WebGL2 && !profile.is_vulkan) {
++        // Shadow maps cannot be written without image stores (the rasterizer skips these draws).
++        out += "discard;\n";
++        return;
++    }
+     out += R"(
+ uint d = uint(clamp(depth, 0.0, 1.0) * float(0xFFFFFF));
+ uint s = uint(combiner_output.g * float(0xFF));
+@@ -1053,7 +1096,7 @@ float ProcTexLookupLUT(int offset, float coord) {
      float index_i = clamp(floor(coord), 0.0, 127.0);
      float index_f = coord - index_i; // fract() cannot be used here because 128.0 needs to be
                                       // extracted as index_i = 127.0 and index_f = 1.0
@@ -1740,7 +1820,7 @@ index 972a248ec..8d7f9a943 100644
      return clamp(entry.r + entry.g * index_f, 0.0, 1.0);
  }
      )";
-@@ -1114,16 +1140,16 @@ float ProcTexNoiseCoef(vec2 x) {
+@@ -1114,16 +1157,16 @@ float ProcTexNoiseCoef(vec2 x) {
      case ProcTexFilter::LinearMipmapNearest:
          out += "int lut_index_i = int(lut_coord) + lut_offset;\n";
          out += "float lut_index_f = fract(lut_coord);\n";
@@ -1760,7 +1840,17 @@ index 972a248ec..8d7f9a943 100644
                 "proctex_lut_offset);\n";
          break;
      }
-@@ -1295,6 +1321,7 @@ void FragmentModule::DefineBindingsVK() {
+@@ -1284,6 +1327,9 @@ void FragmentModule::DefineInterface() {
+         define_input("vec4 normquat", Semantic::Normquat);
+     }
+     define_input("vec3 view", Semantic::View);
++    if (WebGL2 && !profile.is_vulkan && !profile.has_clip_planes) {
++        out += "in vec2 clip_dist;\n";
++    }
+ 
+     // Output attributes
+     out += "layout (location = 0) out vec4 color;\n\n";
+@@ -1295,6 +1341,7 @@ void FragmentModule::DefineBindingsVK() {
      out += "layout(set = 0, binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
      out += "layout(set = 0, binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
      out += "layout(set = 0, binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
@@ -1768,7 +1858,7 @@ index 972a248ec..8d7f9a943 100644
  
      // Texture samplers
      const auto texture_type = config.texture.texture0_type.Value();
-@@ -1332,9 +1359,10 @@ void FragmentModule::DefineBindingsVK() {
+@@ -1332,9 +1379,10 @@ void FragmentModule::DefineBindingsVK() {
  void FragmentModule::DefineBindingsGL() {
      // Uniform and texture buffers
      out += FSUniformBlockDef;
@@ -1782,7 +1872,17 @@ index 972a248ec..8d7f9a943 100644
  
      // Texture samplers
      const auto texture_type = config.texture.texture0_type.Value();
-@@ -1406,7 +1434,7 @@ void FragmentModule::DefineLightingHelpers() {
+@@ -1353,6 +1401,9 @@ void FragmentModule::DefineBindingsGL() {
+     }
+ 
+     // Shadow textures
++    if (WebGL2) {
++        return;
++    }
+     if (texture_type == TextureType::Shadow2D || texture_type == TextureType::ShadowCube) {
+         static constexpr std::array postfixes = {"px", "nx", "py", "ny", "pz", "nz"};
+         for (u32 i = 0; i < postfixes.size(); i++) {
+@@ -1406,7 +1457,7 @@ void FragmentModule::DefineLightingHelpers() {
  
      out += R"(
  float LookupLightingLUT(int lut_index, int index, float delta) {
@@ -1791,6 +1891,86 @@ index 972a248ec..8d7f9a943 100644
      return entry.r + entry.g * delta;
  }
  
+@@ -1434,6 +1485,15 @@ bool AreQuaternionsOpposite(vec4 qa, vec4 qb) {
+ }
+ 
+ void FragmentModule::DefineShadowHelpers() {
++    if (WebGL2 && !profile.is_vulkan) {
++        // No shadow emulation on WebGL2: everything is lit.
++        if (config.texture.texture0_type == TexturingRegs::TextureConfig::Shadow2D) {
++            out += "vec4 shadowTexture(vec2 uv, float w) { return vec4(1.0); }\n";
++        } else if (config.texture.texture0_type == TexturingRegs::TextureConfig::ShadowCube) {
++            out += "vec4 shadowTextureCube(vec2 uv, float w) { return vec4(1.0); }\n";
++        }
++        return;
++    }
+     if (config.framebuffer.shadow_rendering) {
+         out += R"(
+ uint EncodeShadow(uvec2 pixel) {
+diff --git a/src/video_core/shader/generator/glsl_shader_gen.cpp b/src/video_core/shader/generator/glsl_shader_gen.cpp
+index 19c82bf8c..73355b5ac 100644
+--- a/src/video_core/shader/generator/glsl_shader_gen.cpp
++++ b/src/video_core/shader/generator/glsl_shader_gen.cpp
+@@ -78,6 +78,14 @@ constexpr std::string_view PositionOutput =
+     "    gl_Position = vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w);\n";
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++// See GetVertexInterfaceDeclaration: clip planes emulated with a varying and discard.
++constexpr std::string_view EmulatedClipOutput =
++    "    clip_dist = vec2(-vtx_pos.z, enable_clip1 ? dot(clip_coef, vtx_pos) : 0.0);\n";
++#else
++constexpr std::string_view EmulatedClipOutput = "";
++#endif
++
+ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_planes,
+                                                  bool separable_shader) {
+     std::string out;
+@@ -96,6 +104,14 @@ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_p
+     append_variable("float texcoord0_w", ATTRIBUTE_TEXCOORD0_W);
+     append_variable("vec4 normquat", ATTRIBUTE_NORMQUAT);
+     append_variable("vec3 view", ATTRIBUTE_VIEW);
++#ifdef __EMSCRIPTEN__
++    if (!use_clip_planes) {
++        // WebGL2 has no gl_ClipDistance (without WEBGL_clip_cull_distance). The clip distances
++        // are passed to the fragment shader instead, which discards fragments on the wrong side.
++        // Clip distances are linear in clip space, so the interpolated value is exact.
++        out += fmt::format("{}vec2 clip_dist;\n", is_output ? "out " : "in ");
++    }
++#endif
+ 
+     if (is_output && separable_shader) {
+         // gl_PerVertex redeclaration is required for separate shader object
+@@ -161,6 +177,8 @@ void main() {
+             gl_ClipDistance[1] = 0.0;
+         }
+         )";
++    } else {
++        out += EmulatedClipOutput;
+     }
+ 
+     out += "}\n";
+@@ -280,9 +298,20 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
+             out += "    } else {\n";
+             out += "        gl_ClipDistance[1] = 0.0;\n";
+             out += "    }\n\n";
++        } else {
++            out += EmulatedClipOutput;
+         }
+ 
+         out += "    normquat = GetVertexQuaternion();\n";
++        if (!config.state.lighting_disable) {
++            // Only reached when the host has no geometry shaders (WebGL2): the fixed geometry
++            // shader would flip each quaternion into the hemisphere of the triangle's first
++            // vertex so that interpolation does not pass through zero. Without per-primitive
++            // data, move every quaternion into the w >= 0 hemisphere instead (q and -q are the
++            // same rotation). This matches the geometry shader unless a triangle straddles the
++            // w = 0 boundary.
++            out += "    normquat = mix(normquat, -normquat, bvec4(normquat.w < 0.0));\n";
++        }
+         out += "    vec4 vtx_color = vec4(" + semantic(VSOutputAttributes::COLOR_R) + ", " +
+                semantic(VSOutputAttributes::COLOR_G) + ", " +
+                semantic(VSOutputAttributes::COLOR_B) + ", " +
 diff --git a/src/video_core/shader/generator/glsl_shader_gen.h b/src/video_core/shader/generator/glsl_shader_gen.h
 index 21bb06818..1deb8b756 100644
 --- a/src/video_core/shader/generator/glsl_shader_gen.h

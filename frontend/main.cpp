@@ -103,9 +103,8 @@ std::map<std::string, std::string> options = {
     {"citra_use_cpu_jit", "disabled"},
     {"citra_use_fastinterp", "enabled"},
     {"citra_graphics_api", "OpenGL"},
-    // WebGL2 にはジオメトリシェーダーが無い。頂点シェーダーへの組み込みが済むまで、
-    // 頂点処理は CPU（PICA シェーダーのインタプリタ）で行う
-    {"citra_use_hw_shader", "disabled"},
+    // 頂点処理は GPU で行う（WebGL2 に無いジオメトリシェーダーの分は頂点シェーダーに組み込み済み）
+    {"citra_use_hw_shader", "enabled"},
 };
 
 const char* GetVariable(const char* key) {
