@@ -104,7 +104,16 @@ try {
       const buf = new Uint8Array(await (await fetch('/' + rom)).arrayBuffer());
       Module.FS.writeFile('/roms/' + rom, buf);
       const t = performance.now();
-      out.loaded = Module.ccall('web_load_game', 'boolean', ['string'], ['/roms/' + rom]);
+      out.loaded = await (async (path) => {
+      const started = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
+      if (!Module._web_load_state) return started; // 旧ビルドは同期で結果を返す
+      if (!started) return false;
+      for (;;) {
+        const s = Module._web_load_state();
+        if (s >= 2) return s === 2;
+        await new Promise(r => setTimeout(r, 50));
+      }
+    })('/roms/' + rom);
       out.loadMs = Math.round(performance.now() - t);
     } catch (e) {
       out.exception = String(e && e.stack || e).slice(0, 2000);

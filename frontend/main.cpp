@@ -328,9 +328,12 @@ void RunFrame() {
 // ---- エミュレーションスレッドで実行する処理（メインスレッドから委譲される）----
 
 struct LoadRequest {
-    const char* path;
+    std::string path;
     bool result;
 };
+
+// 読み込みの状態（web_load_state）: 0 未開始、1 読み込み中、2 成功、3 失敗
+std::atomic<int> load_state{0};
 
 void LoadGameOnEmuThread(void* arg) {
     auto* req = static_cast<LoadRequest*>(arg);
@@ -341,9 +344,9 @@ void LoadGameOnEmuThread(void* arg) {
     }
 
     retro_game_info info{};
-    info.path = req->path;
+    info.path = req->path.c_str();
     if (!retro_load_game(&info)) {
-        std::fprintf(stderr, "retro_load_game に失敗: %s\n", req->path);
+        std::fprintf(stderr, "retro_load_game に失敗: %s\n", req->path.c_str());
         return;
     }
 
@@ -474,12 +477,34 @@ EMSCRIPTEN_KEEPALIVE void* web_audio_ptr() {
     return &audio_ring;
 }
 
-// JS から呼ぶ: 仮想ファイルシステム上の ROM を読み込んで実行を始める。
-// 読み込みはエミュレーションスレッドで行い、終わるまでメインスレッドは待つ。
+// JS から呼ぶ: 仮想ファイルシステム上の ROM の読み込みをエミュレーションスレッドで始める。
+// すぐに戻るので、結果は web_load_state() が 2（成功）か 3（失敗）になるまで待って確かめる。
+// メインスレッドを止めると、コアが必要とするメインスレッド側の処理（スレッドの起動、
+// ログの出力など）が進まず行き詰まるので、同期では待たない。
 EMSCRIPTEN_KEEPALIVE bool web_load_game(const char* path) {
-    LoadRequest req{path, false};
-    RunOnEmuThread(LoadGameOnEmuThread, &req);
-    return req.result;
+    if (load_state.exchange(1) == 1) {
+        return false; // 読み込み中
+    }
+    auto* req = new LoadRequest{path, false};
+    const bool queued = emscripten_proxy_async(
+        emscripten_proxy_get_system_queue(), emu_thread,
+        [](void* arg) {
+            auto* r = static_cast<LoadRequest*>(arg);
+            LoadGameOnEmuThread(r);
+            load_state.store(r->result ? 2 : 3);
+            delete r;
+        },
+        req);
+    if (!queued) {
+        delete req;
+        load_state.store(3);
+    }
+    return queued;
+}
+
+// JS から呼ぶ: 読み込みの状態。0 未開始、1 読み込み中、2 成功、3 失敗。
+EMSCRIPTEN_KEEPALIVE int web_load_state() {
+    return load_state.load();
 }
 
 } // extern "C"

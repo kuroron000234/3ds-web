@@ -68,7 +68,17 @@
     const data = new Uint8Array(await file.arrayBuffer());
     const path = '/roms/' + file.name;
     Module.FS.writeFile(path, data);
-    const ok = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
+    // 読み込みはエミュレーションスレッドで進む。メインスレッドは止めずに結果を待つ
+    const ok = await (async (path) => {
+      const started = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
+      if (!Module._web_load_state) return started; // 旧ビルドは同期で結果を返す
+      if (!started) return false;
+      for (;;) {
+        const s = Module._web_load_state();
+        if (s >= 2) return s === 2;
+        await new Promise(r => setTimeout(r, 50));
+      }
+    })(path);
     statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗';
   });
 
