@@ -18,6 +18,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <new>
+#include <typeinfo>
 #include <list>
 #include <map>
 #include <mutex>
@@ -510,6 +513,27 @@ struct LoadRequest {
 // 読み込みの状態（web_load_state）: 0 未開始、1 読み込み中、2 成功、3 失敗
 std::atomic<int> load_state{0};
 
+// コアが投げた C++ 例外を受け止めて、種類とメッセージをログに出す。受け止めないと
+// "Uncaught WebAssembly.Exception" としか出ず、原因が分からないままスレッドが止まる。
+// 例外のあとはコアの状態が壊れているかもしれないので、エミュレーションは止める。
+template <typename F>
+bool GuardCore(const char* what, F&& body) {
+    try {
+        body();
+        return true;
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "[MSG] %s中にメモリが足りなくなりました (std::bad_alloc)\n", what);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[MSG] %s中に例外: %s: %s\n", what, typeid(e).name(), e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[MSG] %s中に不明な例外\n", what);
+    }
+    std::fprintf(stderr, "[ERROR] 使用メモリ %.0fMB\n",
+                 static_cast<double>(__builtin_wasm_memory_size(0)) * 65536 / 1048576);
+    game_loaded = false;
+    return false;
+}
+
 void LoadGameOnEmuThread(void* arg) {
     auto* req = static_cast<LoadRequest*>(arg);
     req->result = false;
@@ -520,7 +544,11 @@ void LoadGameOnEmuThread(void* arg) {
 
     retro_game_info info{};
     info.path = req->path.c_str();
-    if (!retro_load_game(&info)) {
+    bool loaded = false;
+    if (!GuardCore("読み込み", [&] { loaded = retro_load_game(&info); })) {
+        return;
+    }
+    if (!loaded) {
         std::fprintf(stderr, "retro_load_game に失敗: %s\n", req->path.c_str());
         return;
     }
@@ -605,7 +633,9 @@ EMSCRIPTEN_KEEPALIVE void web_tick() {
     }
     double now = emscripten_get_now();
     if (now >= next_deadline) {
-        RunFrame();
+        if (!GuardCore("実行", RunFrame)) {
+            return;
+        }
         next_deadline += frame_period_ms;
         now = emscripten_get_now();
         // 3 フレーム以上遅れたら追いつくのをあきらめる（遅い端末で連続実行し続けないように）
