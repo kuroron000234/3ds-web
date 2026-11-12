@@ -28,7 +28,7 @@ diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.t
 index e28f9941b..8824bea1d 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
-@@ -99,3 +99,32 @@ else()
+@@ -99,3 +99,35 @@ else()
  endif()
  
  add_custom_target(azahar_libretro DEPENDS citra_libretro)
@@ -58,6 +58,9 @@ index e28f9941b..8824bea1d 100644
 +            -sPTHREAD_POOL_SIZE=11 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
 +            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_input_ptr,_web_audio_ptr,_web_tick
++            # Name the C++ exception and the functions on its stack when a thread dies of one
++            --pre-js ${WEB_FRONTEND_DIR}/pre.js
++            -sEXCEPTION_STACK_TRACES -sEXPORT_EXCEPTION_HANDLING_HELPERS --profiling-funcs
 +            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap,HEAP32)
 +  endif()
 +endif()
