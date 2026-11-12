@@ -58,6 +58,21 @@ index e28f9941b..b2aed11eb 100644
 +            -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap)
 +  endif()
 +endif()
+diff --git a/src/citra_libretro/emu_window/libretro_window.cpp b/src/citra_libretro/emu_window/libretro_window.cpp
+index 307e14af6..95c985247 100644
+--- a/src/citra_libretro/emu_window/libretro_window.cpp
++++ b/src/citra_libretro/emu_window/libretro_window.cpp
+@@ -47,7 +47,9 @@ void ResetGLState() {
+     glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+     glBlendColor(0, 0, 0, 0);
+ 
+-    glDisable(GL_COLOR_LOGIC_OP);
++    if (!Settings::values.use_gles) {
++        glDisable(GL_COLOR_LOGIC_OP);
++    }
+ 
+     glDisable(GL_DITHER);
+ 
 diff --git a/src/common/hash.h b/src/common/hash.h
 index c08e4b2a0..119a196d4 100644
 --- a/src/common/hash.h
@@ -141,6 +156,93 @@ index 193ccde63..2d14ced5f 100644
  
  #include "artic_base_common.h"
  #include "network/socket_manager.h"
+diff --git a/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag b/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag
+index 54b6e831e..d86c786d9 100644
+--- a/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag
++++ b/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag
+@@ -7,18 +7,32 @@
+ precision highp int;
+ precision highp float;
+ 
++#if defined(GL_ES) && __VERSION__ < 310
++// GLSL ES 3.00 (WebGL2) has no multisample textures. MSAA is never used there, so this
++// variant only has to compile.
++#define SAMPLER_2D_MS sampler2D
++#define USAMPLER_2D_MS usampler2D
++#define TEXTURE_SIZE_MS(t) textureSize(t, 0)
++#define SAMPLE_ID 0
++#else
++#define SAMPLER_2D_MS sampler2DMS
++#define USAMPLER_2D_MS usampler2DMS
++#define TEXTURE_SIZE_MS(t) textureSize(t)
++#define SAMPLE_ID gl_SampleID
++#endif
++
+ layout(location = 0) in mediump vec2 tex_coord;
+ layout(location = 0) out lowp vec4 frag_color;
+ 
+-layout(binding = 0) uniform highp sampler2DMS depth;
+-layout(binding = 1) uniform lowp usampler2DMS stencil;
++layout(binding = 0) uniform highp SAMPLER_2D_MS depth;
++layout(binding = 1) uniform lowp USAMPLER_2D_MS stencil;
+ 
+ void main() {
+-    mediump vec2 coord = tex_coord * vec2(textureSize(depth));
++    mediump vec2 coord = tex_coord * vec2(TEXTURE_SIZE_MS(depth));
+     mediump ivec2 tex_icoord = ivec2(coord);
+     highp uint depth_val =
+-        uint(texelFetch(depth, tex_icoord, gl_SampleID).x * (exp2(32.0) - 1.0));
+-    lowp uint stencil_val = texelFetch(stencil, tex_icoord, gl_SampleID).x;
++        uint(texelFetch(depth, tex_icoord, SAMPLE_ID).x * (exp2(32.0) - 1.0));
++    lowp uint stencil_val = texelFetch(stencil, tex_icoord, SAMPLE_ID).x;
+     highp uvec4 components =
+         uvec4(stencil_val, (uvec3(depth_val) >> uvec3(24u, 16u, 8u)) & 0x000000FFu);
+     frag_color = vec4(components) / (exp2(8.0) - 1.0);
+diff --git a/src/video_core/host_shaders/full_screen_triangle.vert b/src/video_core/host_shaders/full_screen_triangle.vert
+index 5abc2b0d7..b4a74f57a 100644
+--- a/src/video_core/host_shaders/full_screen_triangle.vert
++++ b/src/video_core/host_shaders/full_screen_triangle.vert
+@@ -3,28 +3,29 @@
+ 
+ //? #version 450
+ 
++#if defined(GL_ES) && __VERSION__ < 310
++// GLSL ES 3.00 (WebGL2) has no gl_PerVertex redeclaration and matches varyings by name;
++// the OpenGL fragment shaders call this varying tex_coord.
++#define texcoord tex_coord
++#else
+ out gl_PerVertex {
+     vec4 gl_Position;
+ };
++#endif
+ 
+ layout(location = 0) out vec2 texcoord;
+ 
+ #ifdef VULKAN
+ #define gl_VertexID gl_VertexIndex
+-#define BEGIN_PUSH_CONSTANTS layout(push_constant) uniform PushConstants {
+-#define END_PUSH_CONSTANTS };
+-#define UNIFORM(n)
++layout(push_constant) uniform PushConstants {
++    vec2 tex_scale;
++    vec2 tex_offset;
++};
+ #else // if OpenGL
+-#define BEGIN_PUSH_CONSTANTS
+-#define END_PUSH_CONSTANTS
+-#define UNIFORM(n) layout (location = n) uniform
++layout(location = 0) uniform vec2 tex_scale;
++layout(location = 1) uniform vec2 tex_offset;
+ #endif
+ 
+-BEGIN_PUSH_CONSTANTS
+-UNIFORM(0) vec2 tex_scale;
+-UNIFORM(1) vec2 tex_offset;
+-END_PUSH_CONSTANTS
+-
+ void main() {
+     float x = float((gl_VertexID & 1) << 2);
+     float y = float((gl_VertexID & 2) << 1);
 diff --git a/src/video_core/pica/shader_setup.h b/src/video_core/pica/shader_setup.h
 index 319042958..e29b14fbf 100644
 --- a/src/video_core/pica/shader_setup.h
@@ -153,11 +255,222 @@ index 319042958..e29b14fbf 100644
  #include <optional>
  #include "common/vector_math.h"
  #include "video_core/pica/packed_attribute.h"
+diff --git a/src/video_core/renderer_base.cpp b/src/video_core/renderer_base.cpp
+index 102577b65..a66e0ac11 100644
+--- a/src/video_core/renderer_base.cpp
++++ b/src/video_core/renderer_base.cpp
+@@ -31,7 +31,12 @@ u32 RendererBase::GetResolutionScaleFactor() {
+ }
+ 
+ u8 RendererBase::GetSampleCount() const {
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no multisample textures (glTexStorage2DMultisample); MSAA is disabled there
++    return 1;
++#else
+     return Settings::GetAntiAliasingSampleCount(Settings::values.antialiasing.GetValue());
++#endif
+ }
+ 
+ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
+diff --git a/src/video_core/renderer_opengl/gl_blit_helper.cpp b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+index 6f3de4eca..390b69352 100644
+--- a/src/video_core/renderer_opengl/gl_blit_helper.cpp
++++ b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+@@ -45,17 +45,91 @@ OGLSampler CreateSampler(GLenum filter) {
+     return sampler;
+ }
+ 
++/// glProgramUniform* with an explicit location. WebGL2 has neither glProgramUniform* nor
++/// explicit uniform locations, so there the uniform is looked up by name instead.
++template <typename F>
++void SetProgramUniform(GLuint program, [[maybe_unused]] GLint location,
++                       [[maybe_unused]] const char* name, F&& set) {
++#ifdef __EMSCRIPTEN__
++    const GLuint prev_program = OpenGLState::GetCurState().draw.shader_program;
++    glUseProgram(program);
++    set(glGetUniformLocation(program, name), true);
++    glUseProgram(prev_program);
++#else
++    set(location, false);
++#endif
++}
++
++void SetProgramUniform2f(GLuint program, GLint location, const char* name, GLfloat x, GLfloat y) {
++    SetProgramUniform(program, location, name, [&](GLint loc, bool bound) {
++        if (bound) {
++            glUniform2f(loc, x, y);
++        } else {
++            glProgramUniform2f(program, loc, x, y);
++        }
++    });
++}
++
++void SetProgramUniform1f(GLuint program, GLint location, const char* name, GLfloat x) {
++    SetProgramUniform(program, location, name, [&](GLint loc, bool bound) {
++        if (bound) {
++            glUniform1f(loc, x);
++        } else {
++            glProgramUniform1f(program, loc, x);
++        }
++    });
++}
++
+ OGLProgram CreateProgram(std::string_view frag, std::string_view debug_name) {
+     OGLProgram program;
+     program.SetDebugName(debug_name);
+     program.Create(HostShaders::FULL_SCREEN_TRIANGLE_VERT, frag);
+-    glProgramUniform2f(program.handle, 0, 1.f, 1.f);
+-    glProgramUniform2f(program.handle, 1, 0.f, 0.f);
++    SetProgramUniform2f(program.handle, 0, "tex_scale", 1.f, 1.f);
++    SetProgramUniform2f(program.handle, 1, "tex_offset", 0.f, 0.f);
+     return program;
+ }
+ 
+ } // Anonymous namespace
+ 
++void CopyImageWithBlit(GLuint read_fbo, GLuint draw_fbo, VideoCore::SurfaceType type, GLuint src,
++                       GLenum src_target, u32 src_level, u32 src_layer, u32 src_x, u32 src_y,
++                       GLuint dst, GLenum dst_target, u32 dst_level, u32 dst_layer, u32 dst_x,
++                       u32 dst_y, u32 width, u32 height) {
++    const OpenGLState prev_state = OpenGLState::GetCurState();
++    SCOPE_EXIT({ prev_state.Apply(); });
++
++    OpenGLState state = prev_state;
++    state.scissor.enabled = false;
++    state.draw.read_framebuffer = read_fbo;
++    state.draw.draw_framebuffer = draw_fbo;
++    state.Apply();
++
++    GLenum attachment = GL_COLOR_ATTACHMENT0;
++    GLenum other_attachment = GL_DEPTH_STENCIL_ATTACHMENT;
++    GLbitfield mask = GL_COLOR_BUFFER_BIT;
++    if (type == SurfaceType::Depth) {
++        attachment = GL_DEPTH_ATTACHMENT;
++        other_attachment = GL_COLOR_ATTACHMENT0;
++        mask = GL_DEPTH_BUFFER_BIT;
++    } else if (type == SurfaceType::DepthStencil) {
++        attachment = GL_DEPTH_STENCIL_ATTACHMENT;
++        other_attachment = GL_COLOR_ATTACHMENT0;
++        mask = GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
++    }
++    const auto face = [](GLenum target, u32 layer) -> GLenum {
++        return target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer : target;
++    };
++
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, other_attachment, GL_TEXTURE_2D, 0, 0);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, attachment, face(src_target, src_layer), src,
++                           src_level);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, other_attachment, GL_TEXTURE_2D, 0, 0);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, attachment, face(dst_target, dst_layer), dst,
++                           dst_level);
++    glBlitFramebuffer(src_x, src_y, src_x + width, src_y + height, dst_x, dst_y, dst_x + width,
++                      dst_y + height, mask, GL_NEAREST);
++}
++
+ BlitHelper::BlitHelper(const Driver& driver_)
+     : driver{driver_}, linear_sampler{CreateSampler(GL_LINEAR)},
+       nearest_sampler{CreateSampler(GL_NEAREST)},
+@@ -91,6 +165,12 @@ BlitHelper::~BlitHelper() = default;
+ 
+ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
+                                       const VideoCore::TextureCopy& copy) {
++    if (driver.IsWebGL()) {
++        // WebGL2 cannot sample the stencil aspect (no GL_DEPTH_STENCIL_TEXTURE_MODE)
++        LOG_WARNING(Render_OpenGL, "D24S8 -> RGBA8 reinterpretation is unsupported on WebGL");
++        return false;
++    }
++
+     OpenGLState prev_state = OpenGLState::GetCurState();
+     SCOPE_EXIT({ prev_state.Apply(); });
+ 
+@@ -280,9 +360,15 @@ void BlitHelper::FilterAnime4K(Surface& surface, const VideoCore::TextureBlit& b
+     auto LUMAD = setup_temp_tex(GL_R16F, GL_RED, temp_rect.GetWidth(), temp_rect.GetHeight());
+ 
+     // Copy to SRC
+-    glCopyImageSubData(surface.Handle(0), GL_TEXTURE_2D, 0, blit.src_rect.left,
+-                       blit.src_rect.bottom, 0, SRC.tex.handle, GL_TEXTURE_2D, 0, 0, 0, 0,
+-                       src_width, src_height, 1);
++    if (driver.IsWebGL()) {
++        CopyImageWithBlit(read_fbo.handle, draw_fbo.handle, surface.type, surface.Handle(0),
++                          GL_TEXTURE_2D, 0, 0, blit.src_rect.left, blit.src_rect.bottom,
++                          SRC.tex.handle, GL_TEXTURE_2D, 0, 0, 0, 0, src_width, src_height);
++    } else {
++        glCopyImageSubData(surface.Handle(0), GL_TEXTURE_2D, 0, blit.src_rect.left,
++                           blit.src_rect.bottom, 0, SRC.tex.handle, GL_TEXTURE_2D, 0, 0, 0, 0,
++                           src_width, src_height, 1);
++    }
+ 
+     state.texture_units[0].texture_2d = SRC.tex.handle;
+     state.texture_units[1].texture_2d = LUMAD.tex.handle;
+@@ -332,7 +418,7 @@ void BlitHelper::FilterXbrz(Surface& surface, const VideoCore::TextureBlit& blit
+     SCOPE_EXIT({ prev_state.Apply(); });
+     state.texture_units[0].texture_2d = surface.Handle(0);
+     state.texture_units[0].target = GL_TEXTURE_2D;
+-    glProgramUniform1f(xbrz_program.handle, 2, static_cast<GLfloat>(surface.res_scale));
++    SetProgramUniform1f(xbrz_program.handle, 2, "scale", static_cast<GLfloat>(surface.res_scale));
+     SetParams(xbrz_program, surface.RealExtent(false), blit.src_rect);
+     Draw(xbrz_program, surface.Handle(), draw_fbo.handle, blit.dst_level, blit.dst_rect);
+ }
+@@ -348,13 +434,13 @@ void BlitHelper::FilterMMPX(Surface& surface, const VideoCore::TextureBlit& blit
+ 
+ void BlitHelper::SetParams(OGLProgram& program, const VideoCore::Extent& src_extent,
+                            Common::Rectangle<u32> src_rect) {
+-    glProgramUniform2f(
+-        program.handle, 0,
++    SetProgramUniform2f(
++        program.handle, 0, "tex_scale",
+         static_cast<float>(src_rect.right - src_rect.left) / static_cast<float>(src_extent.width),
+         static_cast<float>(src_rect.top - src_rect.bottom) / static_cast<float>(src_extent.height));
+-    glProgramUniform2f(program.handle, 1,
+-                       static_cast<float>(src_rect.left) / static_cast<float>(src_extent.width),
+-                       static_cast<float>(src_rect.bottom) / static_cast<float>(src_extent.height));
++    SetProgramUniform2f(program.handle, 1, "tex_offset",
++                        static_cast<float>(src_rect.left) / static_cast<float>(src_extent.width),
++                        static_cast<float>(src_rect.bottom) / static_cast<float>(src_extent.height));
+ }
+ 
+ void BlitHelper::Draw(OGLProgram& program, GLuint dst_tex, GLuint dst_fbo, u32 dst_level,
+diff --git a/src/video_core/renderer_opengl/gl_blit_helper.h b/src/video_core/renderer_opengl/gl_blit_helper.h
+index 62fcb8e0c..2bb135f0f 100644
+--- a/src/video_core/renderer_opengl/gl_blit_helper.h
++++ b/src/video_core/renderer_opengl/gl_blit_helper.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include "common/math_util.h"
++#include "video_core/rasterizer_cache/pixel_format.h"
+ #include "video_core/rasterizer_cache/utils.h"
+ #include "video_core/renderer_opengl/gl_resource_manager.h"
+ #include "video_core/renderer_opengl/gl_state.h"
+@@ -20,6 +21,13 @@ namespace OpenGL {
+ class Driver;
+ class Surface;
+ 
++/// Copies a texture rectangle with glBlitFramebuffer (for WebGL2, which lacks glCopyImageSubData).
++/// Targets are GL_TEXTURE_2D or GL_TEXTURE_CUBE_MAP; for cube maps the layer selects the face.
++void CopyImageWithBlit(GLuint read_fbo, GLuint draw_fbo, VideoCore::SurfaceType type, GLuint src,
++                       GLenum src_target, u32 src_level, u32 src_layer, u32 src_x, u32 src_y,
++                       GLuint dst, GLenum dst_target, u32 dst_level, u32 dst_layer, u32 dst_x,
++                       u32 dst_y, u32 width, u32 height);
++
+ class BlitHelper {
+ public:
+     explicit BlitHelper(const Driver& driver);
 diff --git a/src/video_core/renderer_opengl/gl_driver.cpp b/src/video_core/renderer_opengl/gl_driver.cpp
-index 0c02521d6..d25ad19eb 100644
+index 0c02521d6..820ab9e86 100644
 --- a/src/video_core/renderer_opengl/gl_driver.cpp
 +++ b/src/video_core/renderer_opengl/gl_driver.cpp
-@@ -178,6 +178,11 @@ void Driver::CheckExtensionSupport() {
+@@ -75,7 +75,8 @@ static void APIENTRY DebugHandler(GLenum source, GLenum type, GLuint id, GLenum
+ 
+ Driver::Driver() {
+     const bool enable_debug = Settings::values.renderer_debug.GetValue();
+-    if (enable_debug) {
++    // WebGL2 has no KHR_debug
++    if (enable_debug && !IsWebGL()) {
+         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+         glDebugMessageCallback(DebugHandler, nullptr);
+     }
+@@ -178,6 +179,11 @@ void Driver::CheckExtensionSupport() {
      intel_fragment_shader_ordering = GLAD_GL_INTEL_fragment_shader_ordering;
      blend_minmax_factor = GLAD_GL_AMD_blend_minmax_factor || GLAD_GL_NV_blend_minmax_factor;
      is_suitable = GLAD_GL_VERSION_4_3 || GLAD_GL_ES_VERSION_3_2;
@@ -169,20 +482,1344 @@ index 0c02521d6..d25ad19eb 100644
  }
  
  void Driver::FindBugs() {
+@@ -200,6 +206,11 @@ void Driver::FindBugs() {
+         bugs |= DriverBug::BrokenClearTexture;
+     }
+ 
++    // WebGL2 has neither glTextureView nor glClearTexSubImage
++    if (IsWebGL()) {
++        bugs |= DriverBug::BrokenTextureView | DriverBug::BrokenClearTexture;
++    }
++
+     if (vendor == Vendor::ARM && gpu_model.find("Mali") != gpu_model.npos) {
+         constexpr GLint MIN_TEXTURE_BUFFER_SIZE = static_cast<GLint>((1 << 16));
+         GLint max_texel_buffer_size;
+diff --git a/src/video_core/renderer_opengl/gl_driver.h b/src/video_core/renderer_opengl/gl_driver.h
+index 542d6a5e4..a3c45cfab 100644
+--- a/src/video_core/renderer_opengl/gl_driver.h
++++ b/src/video_core/renderer_opengl/gl_driver.h
+@@ -74,6 +74,15 @@ public:
+         return is_gles;
+     }
+ 
++    /// Returns true if the context is WebGL2 (OpenGL ES 3.0 subset, browser build)
++    bool IsWebGL() const noexcept {
++#ifdef __EMSCRIPTEN__
++        return true;
++#else
++        return false;
++#endif
++    }
++
+     /// Returns true if the implementation is suitable for emulation
+     bool IsSuitable() const {
+         return is_suitable;
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 4cc7777f3..381f95e59 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -35,6 +35,29 @@ constexpr std::size_t INDEX_BUFFER_SIZE = 2_MiB;
+ constexpr std::size_t UNIFORM_BUFFER_SIZE = 8_MiB;
+ constexpr std::size_t TEXTURE_BUFFER_SIZE = 2_MiB;
+ 
++#ifdef __EMSCRIPTEN__
++// WebGL2 has no texture buffers, so each LUT buffer is a 2D texture of width LUT_TEX_WIDTH and a
++// 1D index i lives at texel (i % LUT_TEX_WIDTH, i / LUT_TEX_WIDTH). The fragment shader generator
++// hardcodes the same width. Every table has a fixed place, so the offsets never change.
++// LF  (RG32F):   rows 0-23 lighting LUTs (256 entries each), row 24 fog LUT (128)
++// RG  (RG32F):   noise LUT at 0, color map at 128, alpha map at 256 (128 entries each)
++// RGBA(RGBA32F): proctex color LUT at 0, color difference LUT at 256 (256 entries each)
++constexpr GLsizei LUT_TEX_WIDTH = 256;
++constexpr GLsizei LUT_LF_HEIGHT = Pica::LightingRegs::NumLightingSampler + 1;
++constexpr GLsizei LUT_RG_HEIGHT = 2;
++constexpr GLsizei LUT_RGBA_HEIGHT = 2;
++constexpr int LUT_FOG_OFFSET = Pica::LightingRegs::NumLightingSampler * LUT_TEX_WIDTH;
++
++void UploadLUT(TextureUnits::TextureUnit unit, GLuint texture, GLenum format, int offset,
++               GLsizei count, const void* data) {
++    ASSERT(offset % LUT_TEX_WIDTH + count <= LUT_TEX_WIDTH);
++    glActiveTexture(unit.Enum());
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, offset % LUT_TEX_WIDTH, offset / LUT_TEX_WIDTH, count, 1,
++                    format, GL_FLOAT, data);
++}
++#endif
++
+ GLenum MakePrimitiveMode(Pica::PipelineRegs::TriangleTopology topology) {
+     switch (topology) {
+     case Pica::PipelineRegs::TriangleTopology::Shader:
+@@ -64,7 +87,7 @@ GLenum MakeAttributeType(Pica::PipelineRegs::VertexAttributeFormat format) {
+     return GL_UNSIGNED_BYTE;
+ }
+ 
+-[[nodiscard]] GLsizeiptr TextureBufferSize(const Driver& driver, bool is_lf) {
++[[maybe_unused]] [[nodiscard]] GLsizeiptr TextureBufferSize(const Driver& driver, bool is_lf) {
+     // Use the smallest texel size from the texel views
+     // which corresponds to GL_RG32F
+     GLint max_texel_buffer_size;
+@@ -89,9 +112,13 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+       res_cache{memory, custom_tex_manager, runtime, regs, renderer},
+       vertex_buffer{driver, GL_ARRAY_BUFFER, VERTEX_BUFFER_SIZE},
+       uniform_buffer{driver, GL_UNIFORM_BUFFER, UNIFORM_BUFFER_SIZE},
+-      index_buffer{driver, GL_ELEMENT_ARRAY_BUFFER, INDEX_BUFFER_SIZE},
++      index_buffer{driver, GL_ELEMENT_ARRAY_BUFFER, INDEX_BUFFER_SIZE}
++#ifndef __EMSCRIPTEN__
++      ,
+       texture_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, false)},
+-      texture_lf_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, true)} {
++      texture_lf_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, true)}
++#endif
++{
+ 
+     // Clipping plane 0 is always enabled for PICA fixed clip plane z <= 0
+     state.clip_distance[0] = true;
+@@ -151,12 +178,35 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+     state.texture_buffer_lut_rg.texture_buffer = texture_buffer_lut_rg.handle;
+     state.texture_buffer_lut_rgba.texture_buffer = texture_buffer_lut_rgba.handle;
+     state.Apply();
++#ifdef __EMSCRIPTEN__
++    const auto alloc_lut = [](TextureUnits::TextureUnit unit, GLuint texture, GLenum format,
++                              GLsizei height) {
++        glActiveTexture(unit.Enum());
++        glBindTexture(GL_TEXTURE_2D, texture);
++        glTexStorage2D(GL_TEXTURE_2D, 1, format, LUT_TEX_WIDTH, height);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    };
++    alloc_lut(TextureUnits::TextureBufferLUT_LF, texture_buffer_lut_lf.handle, GL_RG32F,
++              LUT_LF_HEIGHT);
++    alloc_lut(TextureUnits::TextureBufferLUT_RG, texture_buffer_lut_rg.handle, GL_RG32F,
++              LUT_RG_HEIGHT);
++    alloc_lut(TextureUnits::TextureBufferLUT_RGBA, texture_buffer_lut_rgba.handle, GL_RGBA32F,
++              LUT_RGBA_HEIGHT);
++    // The textures start empty, so upload every table on the first draw
++    pica.lighting.lut_dirty = pica.lighting.LutAllDirty;
++    pica.fog.lut_dirty = true;
++    pica.proctex.table_dirty = pica.proctex.TableAllDirty;
++#else
+     glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_lf_buffer.GetHandle());
+     glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_buffer.GetHandle());
+     glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, texture_buffer.GetHandle());
++#endif
+ 
+     // Bind index buffer for hardware shader path
+     state.draw.vertex_array = hw_vao.handle;
+@@ -165,9 +215,12 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
+ 
+     glEnable(GL_BLEND);
+ 
+-    glEnable(GL_MULTISAMPLE);
+-    glEnable(GL_SAMPLE_SHADING);
+-    glMinSampleShading(1.0f);
++    // WebGL2 has no sample shading (MSAA is disabled there)
++    if (!driver.IsWebGL()) {
++        glEnable(GL_MULTISAMPLE);
++        glEnable(GL_SAMPLE_SHADING);
++        glMinSampleShading(1.0f);
++    }
+ }
+ 
+ RasterizerOpenGL::~RasterizerOpenGL() = default;
+@@ -533,6 +586,28 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+             memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
+                                       regs.pipeline.index_array.offset);
+         std::tie(buffer_ptr, buffer_offset, std::ignore) = index_buffer.Map(index_buffer_size, 4);
++        if (driver.IsWebGL()) {
++            // WebGL2 has no base-vertex draws: rebase the indices on the CPU instead
++            const u32 base = vertex_array_info.vs_input_index_min;
++            const u32 count = regs.pipeline.num_vertices;
++            if (index_u16) {
++                for (u32 i = 0; i < count; i++) {
++                    u16 index;
++                    std::memcpy(&index, index_data + i * 2, sizeof(u16));
++                    index = static_cast<u16>(index - base);
++                    std::memcpy(buffer_ptr + i * 2, &index, sizeof(u16));
++                }
++            } else {
++                for (u32 i = 0; i < count; i++) {
++                    buffer_ptr[i] = static_cast<u8>(index_data[i] - base);
++                }
++            }
++            index_buffer.Unmap(index_buffer_size);
++            glDrawRangeElements(primitive_mode, 0, vertex_array_info.vs_input_index_max - base,
++                                count, index_u16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
++                                reinterpret_cast<const void*>(buffer_offset));
++            return true;
++        }
+         std::memcpy(buffer_ptr, index_data, index_buffer_size);
+         index_buffer.Unmap(index_buffer_size);
+ 
+@@ -684,7 +759,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+ 
+     vertex_batch.clear();
+ 
+-    if (shadow_rendering) {
++    if (shadow_rendering && !driver.IsWebGL()) {
+         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                         GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+     }
+@@ -921,6 +996,87 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
+     return true;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void RasterizerOpenGL::SyncAndUploadLUTsLF() {
++    if (!pica.lighting.lut_dirty && !pica.fog.lut_dirty) {
++        return;
++    }
++
++    std::array<Common::Vec2f, 256> data;
++    while (pica.lighting.lut_dirty) {
++        const u32 index = std::countr_zero(pica.lighting.lut_dirty);
++        pica.lighting.lut_dirty &= ~(1 << index);
++
++        const auto& source_lut = pica.lighting.luts[index];
++        for (u32 i = 0; i < source_lut.size(); i++) {
++            data[i] = {source_lut[i].ToFloat(), source_lut[i].DiffToFloat()};
++        }
++        const int offset = static_cast<int>(index) * LUT_TEX_WIDTH;
++        UploadLUT(TextureUnits::TextureBufferLUT_LF, texture_buffer_lut_lf.handle, GL_RG,
++                  offset, static_cast<GLsizei>(source_lut.size()), data.data());
++        fs_data.lighting_lut_offset[index / 4][index % 4] = offset;
++        fs_data_dirty = true;
++    }
++
++    if (pica.fog.lut_dirty) {
++        for (u32 i = 0; i < pica.fog.lut.size(); i++) {
++            data[i] = {pica.fog.lut[i].ToFloat(), pica.fog.lut[i].DiffToFloat()};
++        }
++        UploadLUT(TextureUnits::TextureBufferLUT_LF, texture_buffer_lut_lf.handle, GL_RG,
++                  LUT_FOG_OFFSET, static_cast<GLsizei>(pica.fog.lut.size()), data.data());
++        fs_data.fog_lut_offset = LUT_FOG_OFFSET;
++        fs_data_dirty = true;
++        pica.fog.lut_dirty = false;
++    }
++}
++
++void RasterizerOpenGL::SyncAndUploadLUTs() {
++    if (!pica.proctex.table_dirty) {
++        return;
++    }
++
++    const auto sync_value_lut = [&](const auto& lut, GLint& lut_offset, int offset) {
++        std::array<Common::Vec2f, 128> data;
++        static_assert(std::tuple_size_v<std::decay_t<decltype(lut)>> == data.size());
++        for (u32 i = 0; i < lut.size(); i++) {
++            data[i] = {lut[i].ToFloat(), lut[i].DiffToFloat()};
++        }
++        UploadLUT(TextureUnits::TextureBufferLUT_RG, texture_buffer_lut_rg.handle, GL_RG, offset,
++                  static_cast<GLsizei>(data.size()), data.data());
++        lut_offset = offset;
++        fs_data_dirty = true;
++    };
++    const auto sync_color_lut = [&](const auto& lut, GLint& lut_offset, int offset) {
++        std::array<Common::Vec4f, 256> data;
++        static_assert(std::tuple_size_v<std::decay_t<decltype(lut)>> == data.size());
++        for (u32 i = 0; i < lut.size(); i++) {
++            data[i] = lut[i].ToVector() / 255.0f;
++        }
++        UploadLUT(TextureUnits::TextureBufferLUT_RGBA, texture_buffer_lut_rgba.handle, GL_RGBA,
++                  offset, static_cast<GLsizei>(data.size()), data.data());
++        lut_offset = offset;
++        fs_data_dirty = true;
++    };
++
++    if (pica.proctex.noise_lut_dirty) {
++        sync_value_lut(pica.proctex.noise_table, fs_data.proctex_noise_lut_offset, 0);
++    }
++    if (pica.proctex.color_map_dirty) {
++        sync_value_lut(pica.proctex.color_map_table, fs_data.proctex_color_map_offset, 128);
++    }
++    if (pica.proctex.alpha_map_dirty) {
++        sync_value_lut(pica.proctex.alpha_map_table, fs_data.proctex_alpha_map_offset, 256);
++    }
++    if (pica.proctex.color_lut_dirty) {
++        sync_color_lut(pica.proctex.color_table, fs_data.proctex_lut_offset, 0);
++    }
++    if (pica.proctex.color_diff_lut_dirty) {
++        sync_color_lut(pica.proctex.color_diff_table, fs_data.proctex_diff_lut_offset, 256);
++    }
++
++    pica.proctex.table_dirty = 0;
++}
++#else
+ void RasterizerOpenGL::SyncAndUploadLUTsLF() {
+     constexpr std::size_t max_size =
+         sizeof(Common::Vec2f) * 256 * Pica::LightingRegs::NumLightingSampler +
+@@ -1043,6 +1199,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
+ 
+     texture_buffer.Unmap(bytes_used);
+ }
++#endif
+ 
+ void RasterizerOpenGL::UploadUniforms(bool accelerate_draw) {
+     // glBindBufferRange also changes the generic buffer binding point, so we sync the state
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.h b/src/video_core/renderer_opengl/gl_rasterizer.h
+index fef649e62..7322a6547 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.h
++++ b/src/video_core/renderer_opengl/gl_rasterizer.h
+@@ -118,8 +118,10 @@ private:
+     OGLStreamBuffer vertex_buffer;
+     OGLStreamBuffer uniform_buffer;
+     OGLStreamBuffer index_buffer;
++#ifndef __EMSCRIPTEN__
+     OGLStreamBuffer texture_buffer;
+     OGLStreamBuffer texture_lf_buffer;
++#endif
+     GLint uniform_buffer_alignment;
+     std::size_t uniform_size_aligned_vs_pica;
+     std::size_t uniform_size_aligned_vs;
+diff --git a/src/video_core/renderer_opengl/gl_resource_manager.cpp b/src/video_core/renderer_opengl/gl_resource_manager.cpp
+index d9b10c112..a1e6c4a0a 100644
+--- a/src/video_core/renderer_opengl/gl_resource_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_resource_manager.cpp
+@@ -156,8 +156,10 @@ void OGLPipeline::Create() {
+     if (handle != 0)
+         return;
+ 
++#ifndef __EMSCRIPTEN__ // WebGL2 has no program pipelines; the handle stays 0
+     MICROPROFILE_SCOPE(OpenGL_ResourceCreation);
+     glGenProgramPipelines(1, &handle);
++#endif
+ }
+ 
+ void OGLPipeline::Release() {
+diff --git a/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp b/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
+index 3dae1fd1f..c396966da 100644
+--- a/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_disk_cache.cpp
+@@ -111,6 +111,10 @@ ShaderDiskCache::ShaderDiskCache(u64 program_id, bool separable)
+       precompiled_file(AppendPrecompiledFile(!separable)) {}
+ 
+ std::optional<std::vector<ShaderDiskCacheRaw>> ShaderDiskCache::LoadTransferable() {
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no program binaries, so the disk shader cache is disabled on the web.
++    return std::nullopt;
++#endif
+     const bool has_title_id = GetProgramID() != 0;
+     if (!Settings::values.use_hw_shader || !Settings::values.use_disk_shader_cache ||
+         !has_title_id) {
+@@ -447,10 +451,16 @@ void ShaderDiskCache::SaveDumpToFile(u64 unique_identifier, GLuint program, bool
+ }
+ 
+ bool ShaderDiskCache::IsUsable() const {
++#ifdef __EMSCRIPTEN__
++    return false;
++#endif
+     return tried_to_load && Settings::values.use_disk_shader_cache;
+ }
+ 
+ FileUtil::IOFile ShaderDiskCache::AppendTransferableFile() {
++#ifdef __EMSCRIPTEN__
++    return {};
++#endif
+     if (!EnsureDirectories())
+         return {};
+ 
+@@ -482,6 +492,9 @@ FileUtil::IOFile ShaderDiskCache::AppendTransferableFile() {
+ }
+ 
+ FileUtil::IOFile ShaderDiskCache::AppendPrecompiledFile(bool write_header) {
++#ifdef __EMSCRIPTEN__
++    return {};
++#endif
+     if (!EnsureDirectories())
+         return {};
+ 
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index 411b7624c..5d58c1013 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -44,6 +44,10 @@ static u64 GetUniqueIdentifier(const Pica::RegsInternal& regs, const ProgramCode
+ static OGLProgram GeneratePrecompiledProgram(const ShaderDiskCacheDump& dump,
+                                              const std::set<GLenum>& supported_formats,
+                                              bool separable) {
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no glProgramBinary.
++    return {};
++#endif
+ 
+     if (supported_formats.find(dump.binary_format) == supported_formats.end()) {
+         LOG_INFO(Render_OpenGL, "Precompiled cache entry with unsupported format - removing");
+@@ -272,7 +276,7 @@ public:
+             .has_separable_shaders = separable,
+             .has_clip_planes = driver.HasClipCullDistance(),
+             .has_geometry_shader = true,
+-            .has_custom_border_color = true,
++            .has_custom_border_color = !driver.IsWebGL(),
+             .has_fragment_shader_interlock = driver.HasArbFragmentShaderInterlock(),
+             // TODO: This extension requires GLSL 450 / OpenGL 4.5 context.
+             .has_fragment_shader_barycentric = false,
+@@ -351,7 +355,15 @@ ShaderProgramManager::ShaderProgramManager(Frontend::EmuWindow& emu_window_, con
+                                            u64 title_id, bool separable)
+     : emu_window{emu_window_}, driver{driver_},
+       strict_context_required{emu_window.StrictContextRequired()},
+-      impl{std::make_unique<Impl>(driver_, title_id, separable)} {}
++#ifdef __EMSCRIPTEN__
++      // WebGL2 has no separable programs or program pipelines.
++      impl{std::make_unique<Impl>(driver_, title_id, false)} {
++    (void)separable;
++}
++#else
++      impl{std::make_unique<Impl>(driver_, title_id, separable)} {
++}
++#endif
+ 
+ ShaderProgramManager::~ShaderProgramManager() = default;
+ 
 diff --git a/src/video_core/renderer_opengl/gl_shader_util.cpp b/src/video_core/renderer_opengl/gl_shader_util.cpp
-index 8f022132d..74875c333 100644
+index 8f022132d..debf03cfa 100644
 --- a/src/video_core/renderer_opengl/gl_shader_util.cpp
 +++ b/src/video_core/renderer_opengl/gl_shader_util.cpp
-@@ -15,6 +15,12 @@ namespace OpenGL {
+@@ -2,8 +2,13 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
  
++#include <algorithm>
+ #include <array>
++#include <cctype>
++#include <cstdlib>
++#include <mutex>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ #include <glad/glad.h>
+ #include "common/assert.h"
+@@ -13,8 +18,418 @@
+ 
+ namespace OpenGL {
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++
++// WebGL2 only accepts GLSL ES 3.00, which lacks explicit bindings (`layout(binding = N)`),
++// explicit uniform locations and explicit locations on inter-stage varyings. The OpenGL
++// renderer and the host shaders use all of them, so on the web every shader is rewritten
++// before compilation: those qualifiers are removed, and the bindings/locations they carried
++// are remembered per shader object and applied to the program after it is linked.
++
++struct WebSamplerOrBlockBinding {
++    std::string name;
++    GLint binding;
++    GLint array_size; // 0 when not an array
++    bool is_block;
++};
++
++struct WebExplicitUniform {
++    std::string name;
++    GLint location;
++};
++
++struct WebShaderInfo {
++    std::vector<WebSamplerOrBlockBinding> bindings;
++    std::vector<WebExplicitUniform> explicit_uniforms;
++};
++
++std::mutex web_mutex;
++std::unordered_map<GLuint, WebShaderInfo> web_shader_info;
++// program -> (explicit location written in the shader -> real location)
++std::unordered_map<GLuint, std::unordered_map<GLint, GLint>> web_program_locations;
++
++bool IsIdentChar(char c) {
++    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
++}
++
++std::string Trim(std::string_view s) {
++    std::size_t b = 0, e = s.size();
++    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) {
++        ++b;
++    }
++    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
++        --e;
++    }
++    return std::string(s.substr(b, e - b));
++}
++
++/// Removes // and /* */ comments while keeping line breaks.
++std::string StripComments(std::string_view src) {
++    std::string out;
++    out.reserve(src.size());
++    for (std::size_t i = 0; i < src.size(); ++i) {
++        if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
++            while (i < src.size() && src[i] != '\n') {
++                ++i;
++            }
++            if (i < src.size()) {
++                out += '\n';
++            }
++        } else if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '*') {
++            i += 2;
++            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) {
++                if (src[i] == '\n') {
++                    out += '\n';
++                }
++                ++i;
++            }
++            ++i;
++            out += ' ';
++        } else {
++            out += src[i];
++        }
++    }
++    return out;
++}
++
++bool IsEs300PrecisionType(std::string_view type) {
++    static constexpr std::array types{
++        "float",          "int",           "sampler2D",          "sampler3D",
++        "samplerCube",    "sampler2DShadow", "samplerCubeShadow", "sampler2DArray",
++        "sampler2DArrayShadow", "isampler2D", "isampler3D",       "isamplerCube",
++        "isampler2DArray", "usampler2D",   "usampler3D",         "usamplerCube",
++        "usampler2DArray",
++    };
++    return std::find(types.begin(), types.end(), type) != types.end();
++}
++
++bool IsUnsupportedExtension(std::string_view line) {
++    static constexpr std::array prefixes{"GL_ARB_", "GL_NV_", "GL_INTEL_", "GL_ANDROID_",
++                                         "GL_ARM_"};
++    return std::any_of(prefixes.begin(), prefixes.end(), [&](const char* prefix) {
++        return line.find(prefix) != std::string_view::npos;
++    });
++}
++
++/**
++ * Rewrites a GLSL source written for desktop GL 4.3 / GLES 3.2 into GLSL ES 3.00.
++ * Returns the rewritten body and collects the extension directives that must be placed
++ * before any declaration.
++ */
++std::string RewriteForWebGL2(std::string_view source, GLenum type, std::string& extensions,
++                             WebShaderInfo& info) {
++    const std::string src = StripComments(source);
++    std::string out;
++    out.reserve(src.size());
++
++    std::size_t pos = 0;
++    while (pos < src.size()) {
++        std::size_t line_end = src.find('\n', pos);
++        if (line_end == std::string::npos) {
++            line_end = src.size();
++        }
++        const std::string_view line(src.data() + pos, line_end - pos);
++        const std::string trimmed = Trim(line);
++
++        if (trimmed.starts_with("#extension")) {
++            // Extension directives must precede declarations; hoist them into the preamble.
++            if (!IsUnsupportedExtension(trimmed)) {
++                extensions += trimmed;
++                extensions += '\n';
++            }
++            out += '\n';
++            pos = line_end + 1;
++            continue;
++        }
++        if (trimmed.starts_with("precision ")) {
++            // precision <qualifier> <type>;
++            std::string rest = Trim(std::string_view(trimmed).substr(10));
++            const std::size_t space = rest.find(' ');
++            if (space != std::string::npos) {
++                std::string ty = Trim(std::string_view(rest).substr(space + 1));
++                if (!ty.empty() && ty.back() == ';') {
++                    ty.pop_back();
++                }
++                if (!IsEs300PrecisionType(Trim(ty))) {
++                    out += '\n';
++                    pos = line_end + 1;
++                    continue;
++                }
++            }
++        }
++        out += line;
++        out += '\n';
++        pos = line_end + 1;
++    }
++
++    // Process layout qualifiers.
++    std::string result;
++    result.reserve(out.size());
++    std::size_t i = 0;
++    while (i < out.size()) {
++        const std::size_t found = out.find("layout", i);
++        if (found == std::string::npos) {
++            result.append(out, i, std::string::npos);
++            break;
++        }
++        const bool word_start = found == 0 || !IsIdentChar(out[found - 1]);
++        std::size_t p = found + 6;
++        const bool word_end = p >= out.size() || !IsIdentChar(out[p]);
++        while (p < out.size() && std::isspace(static_cast<unsigned char>(out[p]))) {
++            ++p;
++        }
++        if (!word_start || !word_end || p >= out.size() || out[p] != '(') {
++            result.append(out, i, found + 6 - i);
++            i = found + 6;
++            continue;
++        }
++        const std::size_t close = out.find(')', p);
++        if (close == std::string::npos) {
++            result.append(out, i, std::string::npos);
++            break;
++        }
++        result.append(out, i, found - i);
++
++        // Split the qualifier list.
++        std::vector<std::pair<std::string, std::string>> quals; // id, value
++        {
++            const std::string_view list(out.data() + p + 1, close - p - 1);
++            std::size_t start = 0;
++            while (start <= list.size()) {
++                std::size_t comma = list.find(',', start);
++                if (comma == std::string_view::npos) {
++                    comma = list.size();
++                }
++                const std::string item = Trim(list.substr(start, comma - start));
++                if (!item.empty()) {
++                    const std::size_t eq = item.find('=');
++                    if (eq == std::string::npos) {
++                        quals.emplace_back(item, "");
++                    } else {
++                        quals.emplace_back(Trim(std::string_view(item).substr(0, eq)),
++                                           Trim(std::string_view(item).substr(eq + 1)));
++                    }
++                }
++                start = comma + 1;
++            }
++        }
++
++        // Look at the rest of the declaration to know what is being declared.
++        std::size_t decl_end = close + 1;
++        while (decl_end < out.size() && out[decl_end] != ';' && out[decl_end] != '{') {
++            ++decl_end;
++        }
++        const bool is_block = decl_end < out.size() && out[decl_end] == '{';
++        std::vector<std::string> tokens;
++        {
++            std::size_t q = close + 1;
++            while (q < decl_end) {
++                if (IsIdentChar(out[q])) {
++                    std::size_t b = q;
++                    while (q < decl_end && IsIdentChar(out[q])) {
++                        ++q;
++                    }
++                    tokens.emplace_back(out, b, q - b);
++                } else if (out[q] == '[' || out[q] == ']') {
++                    tokens.emplace_back(1, out[q]);
++                    ++q;
++                } else {
++                    ++q;
++                }
++            }
++        }
++        std::string storage;
++        for (const auto& tok : tokens) {
++            if (tok == "uniform" || tok == "in" || tok == "out" || tok == "buffer") {
++                storage = tok;
++                break;
++            }
++        }
++        const bool has_set = std::any_of(quals.begin(), quals.end(),
++                                         [](const auto& q) { return q.first == "set"; });
++
++        // Find the declared name (and array size) for uniforms.
++        std::string name;
++        GLint array_size = 0;
++        if (storage == "uniform" && !tokens.empty()) {
++            if (is_block) {
++                const auto it = std::find(tokens.begin(), tokens.end(), "uniform");
++                if (it != tokens.end() && std::next(it) != tokens.end()) {
++                    name = *std::next(it);
++                }
++            } else {
++                std::size_t idx = tokens.size();
++                if (tokens.back() == "]" && tokens.size() >= 4) {
++                    array_size = static_cast<GLint>(std::strtol(
++                        tokens[tokens.size() - 2].c_str(), nullptr, 0));
++                    idx = tokens.size() - 3;
++                }
++                name = tokens[idx - 1];
++            }
++        }
++
++        std::vector<std::string> kept;
++        for (const auto& [id, value] : quals) {
++            if (has_set) {
++                // Vulkan-only declaration (inside #ifdef VULKAN); leave untouched.
++                kept.push_back(value.empty() ? id : id + " = " + value);
++                continue;
++            }
++            if (id == "binding" && storage == "uniform") {
++                if (!name.empty()) {
++                    info.bindings.push_back({name,
++                                             static_cast<GLint>(std::strtol(value.c_str(),
++                                                                            nullptr, 0)),
++                                             array_size, is_block});
++                }
++                continue;
++            }
++            if (id == "location") {
++                if (storage == "uniform") {
++                    if (!name.empty()) {
++                        info.explicit_uniforms.push_back(
++                            {name, static_cast<GLint>(std::strtol(value.c_str(), nullptr, 0))});
++                    }
++                    continue;
++                }
++                // Inter-stage varyings are matched by name.
++                if ((type == GL_VERTEX_SHADER && storage == "out") ||
++                    (type == GL_FRAGMENT_SHADER && storage == "in")) {
++                    continue;
++                }
++            }
++            kept.push_back(value.empty() ? id : id + " = " + value);
++        }
++        if (!kept.empty()) {
++            result += "layout(";
++            for (std::size_t k = 0; k < kept.size(); ++k) {
++                if (k != 0) {
++                    result += ", ";
++                }
++                result += kept[k];
++            }
++            result += ')';
++        }
++        i = close + 1;
++    }
++    return result;
++}
++
++constexpr std::string_view WebPrecisionPreamble = R"(precision highp float;
++precision highp int;
++precision highp sampler2D;
++precision highp sampler3D;
++precision highp samplerCube;
++precision highp sampler2DShadow;
++precision highp samplerCubeShadow;
++precision highp sampler2DArray;
++precision highp sampler2DArrayShadow;
++precision highp isampler2D;
++precision highp isampler3D;
++precision highp isamplerCube;
++precision highp isampler2DArray;
++precision highp usampler2D;
++precision highp usampler3D;
++precision highp usamplerCube;
++precision highp usampler2DArray;
++#define fma(a, b, c) ((a) * (b) + (c))
++)";
++
++void ApplyWebProgramBindings(GLuint program, std::span<const GLuint> shaders) {
++    std::scoped_lock lock{web_mutex};
++    auto& locations = web_program_locations[program];
++    locations.clear();
++
++    GLint prev_program = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
++    glUseProgram(program);
++    for (const GLuint shader : shaders) {
++        const auto it = web_shader_info.find(shader);
++        if (shader == 0 || it == web_shader_info.end()) {
++            continue;
++        }
++        for (const auto& b : it->second.bindings) {
++            if (b.is_block) {
++                const GLuint index = glGetUniformBlockIndex(program, b.name.c_str());
++                if (index != GL_INVALID_INDEX) {
++                    glUniformBlockBinding(program, index, static_cast<GLuint>(b.binding));
++                }
++                continue;
++            }
++            if (b.array_size == 0) {
++                const GLint loc = glGetUniformLocation(program, b.name.c_str());
++                if (loc != -1) {
++                    glUniform1i(loc, b.binding);
++                }
++                continue;
++            }
++            for (GLint e = 0; e < b.array_size; ++e) {
++                const std::string elem = b.name + "[" + std::to_string(e) + "]";
++                const GLint loc = glGetUniformLocation(program, elem.c_str());
++                if (loc != -1) {
++                    glUniform1i(loc, b.binding + e);
++                }
++            }
++        }
++        for (const auto& u : it->second.explicit_uniforms) {
++            locations[u.location] = glGetUniformLocation(program, u.name.c_str());
++        }
++    }
++    glUseProgram(static_cast<GLuint>(prev_program));
++}
++
++} // Anonymous namespace
++
++GLint GetWebUniformLocation(GLuint program, GLint explicit_location) {
++    std::scoped_lock lock{web_mutex};
++    const auto it = web_program_locations.find(program);
++    if (it == web_program_locations.end()) {
++        return -1;
++    }
++    const auto loc = it->second.find(explicit_location);
++    return loc == it->second.end() ? -1 : loc->second;
++}
++#endif // __EMSCRIPTEN__
++
++void ProgramUniform1f(GLuint program, GLint location, GLfloat v0) {
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no glProgramUniform*; bind the program temporarily instead.
++    GLint prev_program = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
++    glUseProgram(program);
++    glUniform1f(GetWebUniformLocation(program, location), v0);
++    glUseProgram(static_cast<GLuint>(prev_program));
++#else
++    glProgramUniform1f(program, location, v0);
++#endif
++}
++
++void ProgramUniform2f(GLuint program, GLint location, GLfloat v0, GLfloat v1) {
++#ifdef __EMSCRIPTEN__
++    GLint prev_program = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
++    glUseProgram(program);
++    glUniform2f(GetWebUniformLocation(program, location), v0, v1);
++    glUseProgram(static_cast<GLuint>(prev_program));
++#else
++    glProgramUniform2f(program, location, v0, v1);
++#endif
++}
++
++
  GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug_name) {
      std::string preamble;
 +#ifdef __EMSCRIPTEN__
 +    // WebGL2 only accepts GLSL ES 3.00
-+    if (GLES) {
-+        preamble = "#version 300 es\n";
-+    } else
-+#endif
++    WebShaderInfo web_info;
++    std::string web_extensions;
++    const std::string web_source = RewriteForWebGL2(source, type, web_extensions, web_info);
++    source = web_source;
++    preamble = "#version 300 es\n";
++    preamble += web_extensions;
++    preamble += WebPrecisionPreamble;
++#else
      if (GLES) {
          preamble = R"(#version 320 es
  
+@@ -29,6 +444,7 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+     } else {
+         preamble = "#version 430 core\n";
+     }
++#endif
+ 
+     std::string_view debug_type;
+     switch (type) {
+@@ -56,6 +472,13 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+         return shader_id;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    {
++        std::scoped_lock lock{web_mutex};
++        web_shader_info[shader_id] = std::move(web_info);
++    }
++#endif
++
+     glShaderSource(shader_id, static_cast<GLsizei>(src_arr.size()), src_arr.data(), lengths.data());
+     LOG_DEBUG(Render_OpenGL, "Compiling {} shader {}...", debug_type, debug_name);
+     glCompileShader(shader_id);
+@@ -96,11 +519,16 @@ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+         }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no separable programs nor program binaries (glProgramParameteri is null).
++    ASSERT_MSG(!separable_program, "Separable programs are not supported on WebGL2");
++#else
+     if (separable_program) {
+         glProgramParameteri(program_id, GL_PROGRAM_SEPARABLE, GL_TRUE);
+     }
+ 
+     glProgramParameteri(program_id, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
++#endif
+     glLinkProgram(program_id);
+ 
+     // Check the program
+@@ -122,6 +550,12 @@ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+         LOG_ERROR(Render_OpenGL, "Error linking shader {}: No log produced.", debug_name);
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    if (result == GL_TRUE) {
++        ApplyWebProgramBindings(program_id, shaders);
++    }
++#endif
++
+     for (GLuint shader : shaders) {
+         if (shader != 0) {
+             glDetachShader(program_id, shader);
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.h b/src/video_core/renderer_opengl/gl_shader_util.h
+index ee67b934b..76020e156 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.h
++++ b/src/video_core/renderer_opengl/gl_shader_util.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <span>
++#include <string>
++#include <string_view>
+ #include <glad/glad.h>
+ 
+ namespace OpenGL {
+@@ -27,4 +29,18 @@ GLuint LoadShader(std::string_view source, GLenum type, const std::string& debug
+ GLuint LoadProgram(bool separable_program, std::span<const GLuint> shaders,
+                    const std::string& debug_name);
+ 
++/**
++ * Sets a uniform of a program that is not necessarily bound, addressed by the explicit
++ * location written in the shader (`layout(location = N) uniform`). On the web, where neither
++ * glProgramUniform* nor explicit uniform locations exist, the location is translated and the
++ * program is bound temporarily.
++ */
++void ProgramUniform1f(GLuint program, GLint location, GLfloat v0);
++void ProgramUniform2f(GLuint program, GLint location, GLfloat v0, GLfloat v1);
++
++#ifdef __EMSCRIPTEN__
++/// Returns the real location of a uniform declared with `layout(location = N)`, or -1.
++GLint GetWebUniformLocation(GLuint program, GLint explicit_location);
++#endif
++
+ } // namespace OpenGL
+diff --git a/src/video_core/renderer_opengl/gl_state.cpp b/src/video_core/renderer_opengl/gl_state.cpp
+index 4f414990f..8ccfb131e 100644
+--- a/src/video_core/renderer_opengl/gl_state.cpp
++++ b/src/video_core/renderer_opengl/gl_state.cpp
+@@ -220,23 +220,29 @@ void OpenGLState::Apply() const {
+         }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no texture buffers; the LUTs are 2D textures (see RasterizerOpenGL)
++    constexpr GLenum lut_target = GL_TEXTURE_2D;
++#else
++    constexpr GLenum lut_target = GL_TEXTURE_BUFFER;
++#endif
+     // Texture buffer LUTs
+     if (texture_buffer_lut_lf.texture_buffer != cur_state.texture_buffer_lut_lf.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
+-        glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_lf.texture_buffer);
++        glBindTexture(lut_target, texture_buffer_lut_lf.texture_buffer);
+     }
+ 
+     // Texture buffer LUTs
+     if (texture_buffer_lut_rg.texture_buffer != cur_state.texture_buffer_lut_rg.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
+-        glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_rg.texture_buffer);
++        glBindTexture(lut_target, texture_buffer_lut_rg.texture_buffer);
+     }
+ 
+     // Texture buffer LUTs
+     if (texture_buffer_lut_rgba.texture_buffer !=
+         cur_state.texture_buffer_lut_rgba.texture_buffer) {
+         glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
+-        glBindTexture(GL_TEXTURE_BUFFER, texture_buffer_lut_rgba.texture_buffer);
++        glBindTexture(lut_target, texture_buffer_lut_rgba.texture_buffer);
+     }
+ 
+     // Color buffer
+@@ -245,7 +251,8 @@ void OpenGLState::Apply() const {
+         glBindTexture(GL_TEXTURE_2D, color_buffer.texture_2d);
+     }
+ 
+-    // Shadow Images
++    // Shadow Images (WebGL2 has no image load/store)
++#ifndef __EMSCRIPTEN__
+     if (image_shadow_buffer != cur_state.image_shadow_buffer) {
+         glBindImageTexture(ImageUnits::ShadowBuffer, image_shadow_buffer, 0, GL_FALSE, 0,
+                            GL_READ_WRITE, GL_R32UI);
+@@ -280,6 +287,7 @@ void OpenGLState::Apply() const {
+         glBindImageTexture(ImageUnits::ShadowTextureNZ, image_shadow_texture_nz, 0, GL_FALSE, 0,
+                            GL_READ_ONLY, GL_R32UI);
+     }
++#endif
+ 
+     // Framebuffer
+     if (draw.read_framebuffer != cur_state.draw.read_framebuffer) {
+@@ -309,10 +317,12 @@ void OpenGLState::Apply() const {
+         glUseProgram(draw.shader_program);
+     }
+ 
+-    // Program pipeline
++    // Program pipeline (WebGL2 has no separable programs)
++#ifndef __EMSCRIPTEN__
+     if (draw.program_pipeline != cur_state.draw.program_pipeline) {
+         glBindProgramPipeline(draw.program_pipeline);
+     }
++#endif
+ 
+     // Scissor test
+     if (scissor.enabled != cur_state.scissor.enabled) {
+diff --git a/src/video_core/renderer_opengl/gl_stream_buffer.cpp b/src/video_core/renderer_opengl/gl_stream_buffer.cpp
+index aac24a42f..1d9c791b0 100644
+--- a/src/video_core/renderer_opengl/gl_stream_buffer.cpp
++++ b/src/video_core/renderer_opengl/gl_stream_buffer.cpp
+@@ -24,6 +24,13 @@ OGLStreamBuffer::OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
+         allocate_size *= 2;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WebGL2 cannot map buffers. Emscripten emulates glMapBufferRange with a malloc per call and
++    // rejects GL_MAP_UNSYNCHRONIZED_BIT, so stage writes in memory and upload them on Unmap.
++    shadow.resize(buffer_size);
++    glBufferData(gl_target, allocate_size, nullptr, GL_STREAM_DRAW);
++    return;
++#endif
+     if (GLAD_GL_ARB_buffer_storage) {
+         persistent = true;
+         coherent = prefer_coherent;
+@@ -66,12 +73,19 @@ std::tuple<u8*, GLintptr, bool> OGLStreamBuffer::Map(GLsizeiptr size, GLintptr a
+     if (buffer_pos + size > buffer_size) {
+         buffer_pos = 0;
+         invalidate = true;
++#ifdef __EMSCRIPTEN__
++        // Orphan the old storage so pending draws keep their data
++        glBufferData(gl_target, buffer_size, nullptr, GL_STREAM_DRAW);
++#endif
+ 
+         if (persistent) {
+             glUnmapBuffer(gl_target);
+         }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    return std::make_tuple(shadow.data() + buffer_pos, buffer_pos, invalidate);
++#endif
+     if (invalidate || !persistent) {
+         MICROPROFILE_SCOPE(OpenGL_StreamBuffer);
+         GLbitfield flags = GL_MAP_WRITE_BIT | (persistent ? GL_MAP_PERSISTENT_BIT : 0) |
+@@ -88,6 +102,14 @@ std::tuple<u8*, GLintptr, bool> OGLStreamBuffer::Map(GLsizeiptr size, GLintptr a
+ void OGLStreamBuffer::Unmap(GLsizeiptr size) {
+     ASSERT(size <= mapped_size);
+ 
++#ifdef __EMSCRIPTEN__
++    if (size > 0) {
++        glBufferSubData(gl_target, buffer_pos, size, shadow.data() + buffer_pos);
++    }
++    buffer_pos += size;
++    return;
++#endif
++
+     if (!coherent && size > 0) {
+         glFlushMappedBufferRange(gl_target, buffer_pos - mapped_offset, size);
+     }
+diff --git a/src/video_core/renderer_opengl/gl_stream_buffer.h b/src/video_core/renderer_opengl/gl_stream_buffer.h
+index 8b3e29f6b..b35be1034 100644
+--- a/src/video_core/renderer_opengl/gl_stream_buffer.h
++++ b/src/video_core/renderer_opengl/gl_stream_buffer.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <tuple>
++#include <vector>
+ #include "video_core/renderer_opengl/gl_resource_manager.h"
+ 
+ namespace OpenGL {
+@@ -44,6 +45,9 @@ private:
+     GLintptr mapped_offset = 0;
+     GLsizeiptr mapped_size = 0;
+     u8* mapped_ptr = nullptr;
++#ifdef __EMSCRIPTEN__
++    std::vector<u8> shadow; ///< CPU copy that Unmap uploads with glBufferSubData
++#endif
+ };
+ 
+ } // namespace OpenGL
+diff --git a/src/video_core/renderer_opengl/gl_texture_runtime.cpp b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+index 5ccfe015a..c3d64e0ab 100644
+--- a/src/video_core/renderer_opengl/gl_texture_runtime.cpp
++++ b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+@@ -111,9 +111,11 @@ static constexpr std::array<FormatTuple, 8> CUSTOM_TUPLES = {{
+     glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
++#ifndef __EMSCRIPTEN__ // WebGL2 has no glObjectLabel
+     if (!debug_name.empty()) {
+         glObjectLabel(GL_TEXTURE, texture.handle, debug_name.size(), debug_name.data());
+     }
++#endif
+ 
+     return texture;
+ }
+@@ -314,6 +316,18 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
+     const GLenum dest_textarget =
+         dest.texture_type == VideoCore::TextureType::CubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+ 
++    if (driver.IsWebGL()) {
++        for (const auto& copy : copies) {
++            CopyImageWithBlit(read_fbos[FboIndex(source.type)].handle,
++                              draw_fbos[FboIndex(dest.type)].handle, source.type, source.Handle(),
++                              src_textarget, copy.src_level, copy.src_layer, copy.src_offset.x,
++                              copy.src_offset.y, dest.Handle(), dest_textarget, copy.dst_level,
++                              copy.dst_layer, copy.dst_offset.x, copy.dst_offset.y,
++                              copy.extent.width, copy.extent.height);
++        }
++        return true;
++    }
++
+     for (const auto& copy : copies) {
+         glCopyImageSubData(source.Handle(), src_textarget, copy.src_level, copy.src_offset.x,
+                            copy.src_offset.y, copy.src_layer, dest.Handle(), dest_textarget,
+@@ -450,6 +464,13 @@ GLuint Surface::CopyHandle() noexcept {
+     for (u32 level = 0; level < levels; level++) {
+         const u32 width = GetScaledWidth() >> level;
+         const u32 height = GetScaledHeight() >> level;
++        if (driver->IsWebGL()) {
++            CopyImageWithBlit(runtime->read_fbos[FboIndex(type)].handle,
++                              runtime->draw_fbos[FboIndex(type)].handle, type, Handle(1),
++                              GL_TEXTURE_2D, level, 0, 0, 0, copy_texture.handle, GL_TEXTURE_2D,
++                              level, 0, 0, 0, width, height);
++            continue;
++        }
+         glCopyImageSubData(Handle(1), GL_TEXTURE_2D, level, 0, 0, 0, copy_texture.handle,
+                            GL_TEXTURE_2D, level, 0, 0, 0, width, height, 1);
+     }
+@@ -728,10 +749,12 @@ Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferPa
+     state.Apply();
+ 
+     if (shadow_rendering) {
++#ifndef __EMSCRIPTEN__ // WebGL2 has no glFramebufferParameteri (shadows are unsupported there)
+         glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH,
+                                 color->width * res_scale);
+         glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT,
+                                 color->height * res_scale);
++#endif
+         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0,
+                                0);
+@@ -796,7 +819,9 @@ Sampler::Sampler(TextureRuntime&, VideoCore::SamplerParams params) {
+     glSamplerParameteri(handle, GL_TEXTURE_WRAP_S, wrap_s);
+     glSamplerParameteri(handle, GL_TEXTURE_WRAP_T, wrap_t);
+ 
++#ifndef __EMSCRIPTEN__ // WebGL2 has no border color; the fragment shader emulates it
+     glSamplerParameterfv(handle, GL_TEXTURE_BORDER_COLOR, gl_color.AsArray());
++#endif
+ 
+     glSamplerParameterf(handle, GL_TEXTURE_MIN_LOD, lod_min);
+     glSamplerParameterf(handle, GL_TEXTURE_MAX_LOD, lod_max);
+@@ -809,15 +834,19 @@ DebugScope::DebugScope(TextureRuntime& runtime, Common::Vec4f, std::string_view
+     if (!Settings::values.renderer_debug) {
+         return;
+     }
++#ifndef __EMSCRIPTEN__ // WebGL2 has no KHR_debug
+     glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, local_scope_depth,
+                      static_cast<GLsizei>(label.size()), label.data());
++#endif
+ }
+ 
+ DebugScope::~DebugScope() {
+     if (!Settings::values.renderer_debug) {
+         return;
+     }
++#ifndef __EMSCRIPTEN__
+     glPopDebugGroup();
++#endif
+     global_scope_depth--;
+ }
+ 
+diff --git a/src/video_core/renderer_opengl/pica_to_gl.h b/src/video_core/renderer_opengl/pica_to_gl.h
+index 3b5d86ea6..0c504669d 100644
+--- a/src/video_core/renderer_opengl/pica_to_gl.h
++++ b/src/video_core/renderer_opengl/pica_to_gl.h
+@@ -79,6 +79,12 @@ inline GLenum WrapMode(Pica::TexturingRegs::TextureConfig::WrapMode mode) {
+     }
+ 
+     GLenum gl_mode = wrap_mode_table[index];
++#ifdef __EMSCRIPTEN__
++    // WebGL2 has no GL_CLAMP_TO_BORDER; the fragment shader emulates the border color
++    if (gl_mode == GL_CLAMP_TO_BORDER) {
++        gl_mode = GL_CLAMP_TO_EDGE;
++    }
++#endif
+ 
+     // Check for dummy values indicating an unknown mode
+     if (gl_mode == 0) {
+diff --git a/src/video_core/renderer_opengl/renderer_opengl.cpp b/src/video_core/renderer_opengl/renderer_opengl.cpp
+index 8244a83fa..181c7392c 100644
+--- a/src/video_core/renderer_opengl/renderer_opengl.cpp
++++ b/src/video_core/renderer_opengl/renderer_opengl.cpp
+@@ -462,8 +462,15 @@ void RendererOpenGL::ReloadShader(Settings::StereoRenderOption render_3d) {
+     uniform_i_resolution = glGetUniformLocation(shader.handle, "i_resolution");
+     uniform_o_resolution = glGetUniformLocation(shader.handle, "o_resolution");
+     uniform_layer = glGetUniformLocation(shader.handle, "layer");
+-    attrib_position = glGetAttribLocation(shader.handle, "vert_position");
+-    attrib_tex_coord = glGetAttribLocation(shader.handle, "vert_tex_coord");
++    // glGetAttribLocation returns -1 when the program failed to link. Fall back to the explicit
++    // locations in opengl_present.vert instead of passing -1 to glEnableVertexAttribArray.
++    const GLint position = glGetAttribLocation(shader.handle, "vert_position");
++    const GLint tex_coord = glGetAttribLocation(shader.handle, "vert_tex_coord");
++    if (position < 0 || tex_coord < 0) {
++        LOG_ERROR(Render_OpenGL, "Present shader has no vertex attributes (link failed?)");
++    }
++    attrib_position = position < 0 ? 0 : static_cast<GLuint>(position);
++    attrib_tex_coord = tex_coord < 0 ? 1 : static_cast<GLuint>(tex_coord);
+ }
+ 
+ void RendererOpenGL::ConfigureFramebufferTexture(TextureInfo& texture,
+diff --git a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+index 972a248ec..8d7f9a943 100644
+--- a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
++++ b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+@@ -36,19 +36,45 @@ static bool IsPassThroughTevStage(const Pica::TexturingRegs::TevStageConfig& sta
+             stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// WebGL2 (GLSL ES 3.00) has no texture buffers: the LUTs are 2D textures of width 256, and a
++// 1D LUT index i lives at texel (i & 255, i >> 8). See RasterizerOpenGL::SyncAndUploadLUTs*.
++#define LUT_PRECISION(p) ""
++static constexpr std::string_view LUTBindingsGL = R"(
++layout(binding = 3) uniform highp sampler2D texture_buffer_lut_lf;
++layout(binding = 4) uniform highp sampler2D texture_buffer_lut_rg;
++layout(binding = 5) uniform highp sampler2D texture_buffer_lut_rgba;
++vec4 LutFetchLF(int i) { return texelFetch(texture_buffer_lut_lf, ivec2(i & 255, i >> 8), 0); }
++vec4 LutFetchRG(int i) { return texelFetch(texture_buffer_lut_rg, ivec2(i & 255, i >> 8), 0); }
++vec4 LutFetchRGBA(int i) { return texelFetch(texture_buffer_lut_rgba, ivec2(i & 255, i >> 8), 0); }
++
++)";
++#else
++#define LUT_PRECISION(p) "precision " p " samplerBuffer;\n"
++static constexpr std::string_view LUTBindingsGL = R"(
++layout(binding = 3) uniform samplerBuffer texture_buffer_lut_lf;
++layout(binding = 4) uniform samplerBuffer texture_buffer_lut_rg;
++layout(binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;
++)";
++#endif
++static constexpr std::string_view LUTFetchHelpers = R"(
++vec4 LutFetchLF(int i) { return texelFetch(texture_buffer_lut_lf, i); }
++vec4 LutFetchRG(int i) { return texelFetch(texture_buffer_lut_rg, i); }
++vec4 LutFetchRGBA(int i) { return texelFetch(texture_buffer_lut_rgba, i); }
++
++)";
++
+ // High precision may or may not be supported in GLES3. If it isn't, use medium precision instead.
+ static constexpr char fragment_shader_precision_OES[] = R"(
+ #if GL_ES
+ #ifdef GL_FRAGMENT_PRECISION_HIGH
+ precision highp int;
+ precision highp float;
+-precision highp samplerBuffer;
+-precision highp uimage2D;
++)" LUT_PRECISION("highp") R"(precision highp uimage2D;
+ #else
+ precision mediump int;
+ precision mediump float;
+-precision mediump samplerBuffer;
+-precision mediump uimage2D;
++)" LUT_PRECISION("mediump") R"(precision mediump uimage2D;
+ #endif // GL_FRAGMENT_PRECISION_HIGH
+ #endif
+ )";
+@@ -823,7 +849,7 @@ void FragmentModule::WriteFog() {
+     // Generate clamped fog factor from LUT for given fog index
+     out += "float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n"
+            "float fog_f = fog_index - fog_i;\n"
+-           "vec2 fog_lut_entry = texelFetch(texture_buffer_lut_lf, int(fog_i) + "
++           "vec2 fog_lut_entry = LutFetchLF(int(fog_i) + "
+            "fog_lut_offset).rg;\n"
+            "float fog_factor = fog_lut_entry.r + fog_lut_entry.g * fog_f;\n"
+            "fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
+@@ -1053,7 +1079,7 @@ float ProcTexLookupLUT(int offset, float coord) {
+     float index_i = clamp(floor(coord), 0.0, 127.0);
+     float index_f = coord - index_i; // fract() cannot be used here because 128.0 needs to be
+                                      // extracted as index_i = 127.0 and index_f = 1.0
+-    vec2 entry = texelFetch(texture_buffer_lut_rg, int(index_i) + offset).rg;
++    vec2 entry = LutFetchRG(int(index_i) + offset).rg;
+     return clamp(entry.r + entry.g * index_f, 0.0, 1.0);
+ }
+     )";
+@@ -1114,16 +1140,16 @@ float ProcTexNoiseCoef(vec2 x) {
+     case ProcTexFilter::LinearMipmapNearest:
+         out += "int lut_index_i = int(lut_coord) + lut_offset;\n";
+         out += "float lut_index_f = fract(lut_coord);\n";
+-        out += "return texelFetch(texture_buffer_lut_rgba, lut_index_i + "
++        out += "return LutFetchRGBA(lut_index_i + "
+                "proctex_lut_offset) + "
+                "lut_index_f * "
+-               "texelFetch(texture_buffer_lut_rgba, lut_index_i + proctex_diff_lut_offset);\n";
++               "LutFetchRGBA(lut_index_i + proctex_diff_lut_offset);\n";
+         break;
+     case ProcTexFilter::Nearest:
+     case ProcTexFilter::NearestMipmapLinear:
+     case ProcTexFilter::NearestMipmapNearest:
+         out += "lut_coord += float(lut_offset);\n";
+-        out += "return texelFetch(texture_buffer_lut_rgba, int(round(lut_coord)) + "
++        out += "return LutFetchRGBA(int(round(lut_coord)) + "
+                "proctex_lut_offset);\n";
+         break;
+     }
+@@ -1295,6 +1321,7 @@ void FragmentModule::DefineBindingsVK() {
+     out += "layout(set = 0, binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
+     out += "layout(set = 0, binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
+     out += "layout(set = 0, binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
++    out += LUTFetchHelpers;
+ 
+     // Texture samplers
+     const auto texture_type = config.texture.texture0_type.Value();
+@@ -1332,9 +1359,10 @@ void FragmentModule::DefineBindingsVK() {
+ void FragmentModule::DefineBindingsGL() {
+     // Uniform and texture buffers
+     out += FSUniformBlockDef;
+-    out += "layout(binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
+-    out += "layout(binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
+-    out += "layout(binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
++    out += LUTBindingsGL;
++#ifndef __EMSCRIPTEN__
++    out += LUTFetchHelpers;
++#endif
+ 
+     // Texture samplers
+     const auto texture_type = config.texture.texture0_type.Value();
+@@ -1406,7 +1434,7 @@ void FragmentModule::DefineLightingHelpers() {
+ 
+     out += R"(
+ float LookupLightingLUT(int lut_index, int index, float delta) {
+-    vec2 entry = texelFetch(texture_buffer_lut_lf, lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
++    vec2 entry = LutFetchLF(lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
+     return entry.r + entry.g * delta;
+ }
+ 
+diff --git a/src/video_core/shader/generator/glsl_shader_gen.h b/src/video_core/shader/generator/glsl_shader_gen.h
+index 21bb06818..1deb8b756 100644
+--- a/src/video_core/shader/generator/glsl_shader_gen.h
++++ b/src/video_core/shader/generator/glsl_shader_gen.h
+@@ -4,19 +4,23 @@
+ 
+ #pragma once
+ 
++#ifdef __EMSCRIPTEN__
++#define SAMPLER_BUFFER_PRECISION(p) "" // WebGL2 has no samplerBuffer
++#else
++#define SAMPLER_BUFFER_PRECISION(p) "precision " p " samplerBuffer;\n"
++#endif
++
+ // High precision may or may not be supported in GLES3. If it isn't, use medium precision instead.
+ static constexpr char fragment_shader_precision_OES[] = R"(
+ #if GL_ES
+ #ifdef GL_FRAGMENT_PRECISION_HIGH
+ precision highp int;
+ precision highp float;
+-precision highp samplerBuffer;
+-precision highp uimage2D;
++)" SAMPLER_BUFFER_PRECISION("highp") R"(precision highp uimage2D;
+ #else
+ precision mediump int;
+ precision mediump float;
+-precision mediump samplerBuffer;
+-precision mediump uimage2D;
++)" SAMPLER_BUFFER_PRECISION("mediump") R"(precision mediump uimage2D;
+ #endif // GL_FRAGMENT_PRECISION_HIGH
+ #endif
+ )";
