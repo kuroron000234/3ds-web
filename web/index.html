@@ -34,7 +34,9 @@
   const statusEl = document.getElementById('status');
   const romEl = document.getElementById('rom');
 
+  let lastMessage = ''; // コアが画面表示用に出した直近のメッセージ（読み込み失敗の理由など）
   function log(text) {
+    if (text.startsWith('[MSG] ')) lastMessage = text.slice(6).trim();
     logEl.textContent += text + '\n';
     logEl.scrollTop = logEl.scrollHeight;
   }
@@ -42,7 +44,7 @@
   // 不具合の報告用: ログからエラーに関係する行（と末尾の数行）だけを取り出してコピーする
   document.getElementById('copylog').addEventListener('click', async (ev) => {
     const lines = logEl.textContent.split('\n').filter(l => l);
-    const hits = lines.filter(l => /error|critical|abort|exception|assert|unreachable|失敗|異常/i.test(l));
+    const hits = lines.filter(l => /\[MSG\]|error|critical|abort|exception|assert|unreachable|warning|失敗|異常/i.test(l) && !/FetchVariable/.test(l));
     const text = ['状態: ' + statusEl.textContent, 'ROM: ' + (romEl.files[0] ? romEl.files[0].name.replace(/^.*(\.[^.]+)$/, '*$1') + ' ' + Math.round(romEl.files[0].size / 1048576) + 'MB' : 'なし'),
       '--- エラー行（最大 40）', ...[...new Set(hits)].slice(-40), '--- 末尾 10 行', ...lines.slice(-10)].join('\n');
     try { await navigator.clipboard.writeText(text); ev.target.textContent = 'コピーしました'; }
@@ -82,6 +84,7 @@
     const file = romEl.files[0];
     if (!file) return;
     statusEl.textContent = '読み込み中: ' + file.name;
+    lastMessage = '';
     // TODO: 大きな ROM は丸ごとメモリに載せず、OPFS か WORKERFS で読む
     const data = new Uint8Array(await file.arrayBuffer());
     const path = '/roms/' + file.name;
@@ -98,7 +101,7 @@
         await new Promise(r => setTimeout(r, 50));
       }
     })(path);
-    statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗';
+    statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗' + (lastMessage ? ': ' + lastMessage : '');
   });
 
   // ---- 入力: 共有メモリ（frontend/main.cpp の input_state）へ書く ----

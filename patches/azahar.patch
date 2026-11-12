@@ -135,6 +135,85 @@ index 814863e52..282c30c60 100644
  endif()
  
  if (CITRA_USE_PRECOMPILED_HEADERS)
+diff --git a/src/core/file_sys/ncch_container.cpp b/src/core/file_sys/ncch_container.cpp
+index bf4abb023..e1c83d199 100644
+--- a/src/core/file_sys/ncch_container.cpp
++++ b/src/core/file_sys/ncch_container.cpp
+@@ -258,7 +258,7 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
+ 
+     LOG_DEBUG(Service_FS, "NCCH type: {}", file->GetType().to_string());
+ 
+-    if (!ncch_header.no_crypto) {
++    if (!ncch_header.no_crypto && !IsMisflaggedPlaintext()) {
+         // Encrypted NCCH are not supported
+         return Loader::ResultStatus::ErrorEncrypted;
+     }
+@@ -267,6 +267,39 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
+     return Loader::ResultStatus::Success;
+ }
+ 
++bool NCCHContainer::IsMisflaggedPlaintext() {
++#ifdef __EMSCRIPTEN__
++    // No decryption happens here: this only recognises contents that are already plaintext.
++    if (!file || !file->IsOpen()) {
++        return false;
++    }
++    bool plaintext = false;
++    if (ncch_header.extended_header_size) {
++        // A decrypted extended header repeats the program ID as the jump ID
++        ExHeader_Header exheader{};
++        plaintext = file->ReadAtBytes(&exheader, sizeof(exheader), sizeof(NCCH_Header)) ==
++                        sizeof(exheader) &&
++                    exheader.system_info.jump_id == exheader.arm11_system_local_caps.program_id;
++    } else if (ncch_header.exefs_size) {
++        // No extended header (DLC, system archives): look for a readable ExeFS file name
++        ExeFs_Header exefs{};
++        const std::size_t offset = static_cast<std::size_t>(ncch_header.exefs_offset) * kBlockSize;
++        if (file->ReadAtBytes(&exefs, sizeof(exefs), offset) == sizeof(exefs)) {
++            const std::string_view name{exefs.section[0].name,
++                                        strnlen(exefs.section[0].name, 8)};
++            plaintext = name == ".code" || name == "icon" || name == "banner" || name == "logo";
++        }
++    }
++    if (plaintext) {
++        LOG_WARNING(Service_FS, "NCCH is marked as encrypted but its contents are decrypted. "
++                                "Loading it without crypto.");
++    }
++    return plaintext;
++#else
++    return false;
++#endif
++}
++
+ Loader::ResultStatus NCCHContainer::Load() {
+     if (is_loaded)
+         return Loader::ResultStatus::Success;
+@@ -289,7 +322,7 @@ Loader::ResultStatus NCCHContainer::Load() {
+             block_size = 1;
+         }
+ 
+-        if (!ncch_header.no_crypto) {
++        if (!ncch_header.no_crypto && !IsMisflaggedPlaintext()) {
+             // Encrypted NCCH are not supported
+             return Loader::ResultStatus::ErrorEncrypted;
+         }
+diff --git a/src/core/file_sys/ncch_container.h b/src/core/file_sys/ncch_container.h
+index 1ae7aadc9..9cb2fd056 100644
+--- a/src/core/file_sys/ncch_container.h
++++ b/src/core/file_sys/ncch_container.h
+@@ -266,6 +266,12 @@ public:
+      */
+     Loader::ResultStatus LoadOverrides();
+ 
++    /**
++     * Some dumps were decrypted by tools that left the NoCrypto flag clear. Returns true when
++     * the NCCH is flagged as encrypted but its contents are plainly readable.
++     */
++    bool IsMisflaggedPlaintext();
++
+     /**
+      * Reads an application ExeFS section of an NCCH file (e.g. .code, .logo, etc.)
+      * @param name Name of section to read out of NCCH file
 diff --git a/src/core/nus_download.cpp b/src/core/nus_download.cpp
 index 28442a8d7..5d18f98db 100644
 --- a/src/core/nus_download.cpp
