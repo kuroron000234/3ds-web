@@ -18,7 +18,7 @@
 <body>
 <main>
   <div class="row">
-    <label>ROM を選択（自分で吸い出したもの）: <input type="file" id="rom" disabled></label>
+    <label>ROM を選択（自分で吸い出した .3ds / .cia など）: <input type="file" id="rom" disabled></label>
     <span id="status">読み込み中…</span>
     <span id="speed"></span>
     <button id="copylog" type="button">エラーをコピー</button>
@@ -182,6 +182,44 @@
     updateGfxUi();
   }
 
+  // ---- CIA: 中のメインのコンテンツ（NCCH）だけを取り出して起動する ----
+  // Azahar は CIA を本体へのインストール用として扱い、直接は起動できない。インストールは中身を
+  // まるごと仮想 SD（メモリ）へ書くので大きなソフトは載らない。そこで CIA の中の
+  // コンテンツ 0（ゲーム本体の NCCH）の範囲を File の slice として渡し、.cxi と同じく必要な分だけ読む。
+  // 更新データ・DLC は含まない。CIA 自体が暗号化されたもの（タイトル鍵の暗号）は扱わない。
+  async function ciaMainContent(file) {
+    const read = async (off, len) => new DataView(await file.slice(off, off + len).arrayBuffer());
+    const align = (n) => Math.ceil(n / 64) * 64;
+    const h = await read(0, 0x2020);
+    if (h.byteLength < 0x2020 || h.getUint32(0, true) !== 0x2020) throw new Error('CIA の形式ではありません（圧縮された .zcia には未対応）');
+    const certSize = h.getUint32(0x08, true), ticketSize = h.getUint32(0x0C, true), tmdSize = h.getUint32(0x10, true);
+    const tmdOff = align(0x2020) + align(certSize) + align(ticketSize);
+    const contentOff = tmdOff + align(tmdSize);
+    const tmd = await read(tmdOff, tmdSize);
+    const SIG = { 0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80, 0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80 };
+    const sigLen = SIG[tmd.getUint32(0, false)];
+    if (!sigLen) throw new Error('CIA の TMD を読めません');
+    const count = tmd.getUint16(sigLen + 0x9E, false);
+    const present = (i) => (h.getUint8(0x20 + (i >> 3)) & (0x80 >> (i & 7))) !== 0;
+    let off = contentOff;
+    for (let r = 0; r < count; r++) {
+      const rec = sigLen + 0xC4 + 0x900 + r * 0x30;
+      const index = tmd.getUint16(rec + 4, false), type = tmd.getUint16(rec + 6, false);
+      const size = Number(tmd.getBigUint64(rec + 8, false));
+      if (!present(index)) continue;
+      if (index === 0) {
+        const magic = new TextDecoder().decode(new Uint8Array((await read(off + 0x100, 4)).buffer));
+        if ((type & 1) || magic !== 'NCCH') {
+          throw new Error('暗号化された CIA は読めません（GodMode9 などで復号した CIA か .3ds を使ってください）');
+        }
+        log(`CIA: コンテンツ 0（${(size / 1048576).toFixed(1)}MB）を起動します。更新データ・DLC は含まれません`);
+        return file.slice(off, off + size);
+      }
+      off += size;
+    }
+    throw new Error('CIA にゲーム本体（コンテンツ 0）が入っていません（更新データや DLC の CIA は単体では起動できません）');
+  }
+
   romEl.addEventListener('change', async () => {
     const file = romEl.files[0];
     if (!file) return;
@@ -191,9 +229,14 @@
     const LANGS = { ja: 'Japanese', fr: 'French', es: 'Spanish', de: 'German', it: 'Italian', nl: 'Dutch', pt: 'Portuguese', ru: 'Russian', ko: 'Korean', zh: 'Traditional Chinese' };
     const lang = LANGS[(navigator.language || 'en').slice(0, 2)];
     if (lang) Module.ccall('web_set_option', null, ['string', 'string'], ['citra_language_value', lang]);
+    let rom = file, path = '/roms/' + file.name;
+    if (/\.cia$/i.test(file.name)) {
+      try { rom = await ciaMainContent(file); }
+      catch (e) { statusEl.textContent = '読み込み失敗: ' + e.message; log('CIA: ' + e.message); return; }
+      path = path.replace(/\.cia$/i, '.cxi');
+    }
     applyGraphics();
-    const path = '/roms/' + file.name;
-    await mountRom(path, file);
+    await mountRom(path, rom);
     // 読み込みはエミュレーションスレッドで進む。メインスレッドは止めずに結果を待つ
     const ok = await (async (path) => {
       const started = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
