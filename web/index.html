@@ -42,6 +42,7 @@
     キー: A=X　B=Z　X=S　Y=A　L=Q　R=W　ZL=1　ZR=2　START=Enter　SELECT=Backspace　HOME=Esc　
     十字キー=T/F/G/H　スライドパッド=矢印　C スティック=I/J/K/L。下画面はクリック・タッチで操作。
     ゲームパッドも使えます。音はページを一度クリックするかキーを押すと鳴ります。
+    セーブはこのブラウザに自動で保存されます（サイトのデータを消すと消えます）。
   </div>
   <div class="row" id="log"></div>
   <div class="row" id="keys">
@@ -97,6 +98,72 @@
     log('警告: crossOriginIsolated が無効です。COOP/COEP ヘッダ付きで配信してください。');
   }
 
+  // ---- セーブの保存: /azahar/save（仮想 SD・NAND）をブラウザの IndexedDB に残す ----
+  // Emscripten のファイルシステムはメモリ上にあり、ページを閉じると消える。数秒おきに
+  // 変わったファイルだけを IndexedDB へ書き、次に開いたときに起動前に戻す。
+  // ファイルシステムはメインスレッドにあり、エミュレーションスレッドの読み書きもここで処理されるので、
+  // この JS が動いている間にファイルが書きかけになることはない。
+  const saves = (() => {
+    const ROOT = '/azahar/save';
+    let db = null;
+    const known = new Map(); // パス → 'mtime:size'（IndexedDB にある版）
+    const req = (r) => new Promise((ok, ng) => { r.onsuccess = () => ok(r.result); r.onerror = () => ng(r.error); });
+    async function open() {
+      if (db) return db;
+      const r = indexedDB.open('3ds-web-saves', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('files', { keyPath: 'path' });
+      return (db = await req(r));
+    }
+    const stamp = (st) => (st.mtime instanceof Date ? st.mtime.getTime() : Number(st.mtime)) + ':' + st.size;
+    function walk(dir, out) {
+      for (const name of Module.FS.readdir(dir)) {
+        if (name === '.' || name === '..') continue;
+        const path = dir + '/' + name;
+        const st = Module.FS.stat(path);
+        if (Module.FS.isDir(st.mode)) walk(path, out);
+        else out.set(path, stamp(st));
+      }
+      return out;
+    }
+    async function restore() {
+      const all = await req((await open()).transaction('files').objectStore('files').getAll());
+      for (const f of all) {
+        const dir = f.path.slice(0, f.path.lastIndexOf('/'));
+        Module.FS.mkdirTree(dir);
+        Module.FS.writeFile(f.path, f.data);
+      }
+      // 書き戻した時点の状態を基準にする（戻しただけのファイルを次の保存で書き直さない）
+      for (const [path, st] of walk(ROOT, new Map())) known.set(path, st);
+      if (all.length) log(`セーブを読み込みました（${all.length} ファイル）`);
+    }
+    let busy = false;
+    async function flush() {
+      if (busy || !Module.FS) return;
+      busy = true;
+      try {
+        const now = walk(ROOT, new Map());
+        const changed = [...now].filter(([p, st]) => known.get(p) !== st);
+        const removed = [...known.keys()].filter((p) => !now.has(p));
+        if (!changed.length && !removed.length) return;
+        const tx = (await open()).transaction('files', 'readwrite');
+        const store = tx.objectStore('files');
+        for (const [path] of changed) store.put({ path, data: Module.FS.readFile(path) });
+        for (const path of removed) store.delete(path);
+        await new Promise((ok, ng) => { tx.oncomplete = ok; tx.onerror = () => ng(tx.error); tx.onabort = () => ng(tx.error); });
+        for (const [path, st] of changed) known.set(path, st);
+        for (const path of removed) known.delete(path);
+      } catch (e) {
+        log('セーブを保存できません: ' + e);
+      } finally {
+        busy = false;
+      }
+    }
+    return { restore, flush };
+  })();
+  setInterval(() => { if (gameStarted) saves.flush(); }, 3000);
+  addEventListener('visibilitychange', () => { if (document.hidden && gameStarted) saves.flush(); });
+  addEventListener('pagehide', () => { if (gameStarted) saves.flush(); });
+
   var Module = {
     canvas: document.getElementById('canvas'),
     print: log,
@@ -105,6 +172,10 @@
       for (const dir of ['/azahar', '/azahar/system', '/azahar/save', '/roms']) {
         Module.FS.mkdir(dir);
       }
+      // 前回までのセーブを戻してから起動する
+      Module.addRunDependency('restore-saves');
+      saves.restore().catch((e) => log('セーブを読み込めません: ' + e))
+        .finally(() => Module.removeRunDependency('restore-saves'));
     }],
     onRuntimeInitialized: () => {
       statusEl.textContent = '準備完了';
