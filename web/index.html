@@ -327,12 +327,16 @@
     const magic = (v, o) => String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
     if (magic(head, 0x100) === 'NCSD') base = head.getUint32(0x120, true) * 0x200;
     const n = await read(base, 0x200);
-    if (magic(n, 0x100) !== 'NCCH') return '診断: NCCH が見つかりません';
+    if (magic(n, 0x100) !== 'NCCH') return { text: '診断: NCCH が見つかりません', broken: false };
     const f = (i) => n.getUint8(0x188 + i);
     const exhSize = n.getUint32(0x180, true);
     const x = await read(base + 0x200, 0x400);
     const seg = (o) => `addr ${hex(x.getUint32(o, true))} pages ${x.getUint32(o + 4, true)} size ${hex(x.getUint32(o + 8, true))}`;
     const name = Array.from({ length: 8 }, (_, i) => x.getUint8(i)).filter((c) => c >= 32 && c < 127).map((c) => String.fromCharCode(c)).join('');
+    // 実機のプログラムは .text/.rodata/.data 合わせて数十 MB まで。exheader が暗号化のまま
+    // （復号済みの印だけ付いた不完全な吸い出し）だと、ページ数や bss がでたらめな巨大値になる
+    const pages = x.getUint32(0x14, true) + x.getUint32(0x24, true) + x.getUint32(0x34, true);
+    const broken = exhSize > 0 && (pages > 0x10000 || x.getUint32(0x3C, true) > 0x10000000);
     const out = [`診断: NCCH @${hex(base)} flags[3]=${hex(f(3))} flags[7]=${hex(f(7))} exheader ${hex(exhSize)}`,
       `診断: exheader name "${name}" flags ${hex(x.getUint8(0xD))} text ${seg(0x10)} stack ${hex(x.getUint32(0x1C, true))}`,
       `診断: ro ${seg(0x20)} data ${seg(0x30)} bss ${hex(x.getUint32(0x3C, true))}`];
@@ -349,7 +353,7 @@
       }
       out.push(`診断: exefs ${nm} off ${hex(off)} size ${hex(size)}${extra}`);
     }
-    return out.join('\n');
+    return { text: out.join('\n'), broken };
   }
 
   romEl.addEventListener('change', async () => {
@@ -368,7 +372,12 @@
       catch (e) { statusEl.textContent = '読み込み失敗: ' + e.message; log('CIA: ' + e.message); return; }
       path = path.replace(/\.cia$/i, '.cxi');
     }
-    try { for (const l of (await romDiag(rom)).split('\n')) log(l); } catch (e) { log('診断: 読めません ' + e); }
+    let diag = { text: '', broken: false };
+    try { diag = await romDiag(rom); for (const l of diag.text.split('\n')) log(l); } catch (e) { log('診断: 読めません ' + e); }
+    if (diag.broken) {
+      statusEl.textContent = '読み込み失敗: プログラム情報（exheader）が暗号化されたままです。復号が不完全な吸い出しです（GodMode9 などで吸い出し直してください）';
+      return;
+    }
     applyGraphics();
     await mountRom(path, rom);
     // 読み込みはエミュレーションスレッドで進む。メインスレッドは止めずに結果を待つ
