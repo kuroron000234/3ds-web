@@ -7,7 +7,8 @@
 <style>
   body { margin: 0; background: #111; color: #ddd; font: 14px/1.5 system-ui, sans-serif; }
   main { max-width: 820px; margin: 0 auto; padding: 16px; }
-  canvas { display: block; width: 100%; max-width: 800px; background: #000; image-rendering: pixelated; }
+  canvas { display: block; width: 100%; max-width: 800px; background: #000; image-rendering: pixelated; touch-action: none; }
+  #keys { color: #999; font-size: 12px; }
   #log { height: 220px; overflow: auto; background: #000; padding: 8px; font: 12px/1.4 monospace; white-space: pre-wrap; }
   .row { margin: 12px 0; }
 </style>
@@ -17,8 +18,14 @@
   <div class="row">
     <label>ROM を選択（自分で吸い出したもの）: <input type="file" id="rom" disabled></label>
     <span id="status">読み込み中…</span>
+    <span id="speed"></span>
   </div>
   <canvas id="canvas" width="400" height="480"></canvas>
+  <div class="row" id="keys">
+    キー: A=X　B=Z　X=S　Y=A　L=Q　R=W　ZL=1　ZR=2　START=Enter　SELECT=Backspace　HOME=Esc　
+    十字キー=T/F/G/H　スライドパッド=矢印　C スティック=I/J/K/L。下画面はクリック・タッチで操作。
+    ゲームパッドも使えます。音はページを一度クリックするかキーを押すと鳴ります。
+  </div>
   <div class="row" id="log"></div>
 </main>
 <script>
@@ -47,6 +54,7 @@
     onRuntimeInitialized: () => {
       statusEl.textContent = '準備完了';
       romEl.disabled = false;
+      inputReady();
       window.__ready = true;
     },
     onAbort: (what) => { statusEl.textContent = '異常終了: ' + what; },
@@ -63,6 +71,169 @@
     const ok = Module.ccall('web_load_game', 'boolean', ['string'], [path]);
     statusEl.textContent = ok ? '実行中: ' + file.name : '読み込み失敗';
   });
+
+  // ---- 入力: 共有メモリ（frontend/main.cpp の input_state）へ書く ----
+  // ビット番号は RETRO_DEVICE_ID_JOYPAD_*（B=0 Y=1 SELECT=2 START=3 UP=4 DOWN=5 LEFT=6 RIGHT=7
+  // A=8 X=9 L=10 R=11 ZL=12 ZR=13 HOME=14 R3=15）
+  const KEY_BUTTONS = {
+    KeyX: 8, KeyZ: 0, KeyS: 9, KeyA: 1, KeyQ: 10, KeyW: 11, Digit1: 12, Digit2: 13,
+    Enter: 3, Backspace: 2, ShiftRight: 2, Escape: 14,
+    KeyT: 4, KeyG: 5, KeyF: 6, KeyH: 7,
+  };
+  // [スティック番号, 軸, 向き]
+  const KEY_AXES = {
+    ArrowLeft: [0, 0, -1], ArrowRight: [0, 0, 1], ArrowUp: [0, 1, -1], ArrowDown: [0, 1, 1],
+    KeyJ: [1, 0, -1], KeyL: [1, 0, 1], KeyI: [1, 1, -1], KeyK: [1, 1, 1],
+  };
+  // 標準配置のゲームパッド → 3DS（位置で合わせる: 下=B 右=A 左=Y 上=X）
+  const PAD_BUTTONS = [0, 8, 1, 9, 10, 11, 12, 13, 2, 3, -1, 15, 4, 5, 6, 7, 14];
+  const input = { view: null, keys: new Set(), pad: 0, padAxes: [0, 0, 0, 0] };
+
+  function writeInput() {
+    const v = input.view;
+    if (!v) return;
+    let buttons = input.pad;
+    const axes = input.padAxes.slice();
+    const keyAxes = [0, 0, 0, 0];
+    for (const code of input.keys) {
+      if (code in KEY_BUTTONS) buttons |= 1 << KEY_BUTTONS[code];
+      const a = KEY_AXES[code];
+      if (a) keyAxes[a[0] * 2 + a[1]] += a[2];
+    }
+    Atomics.store(v, 0, buttons);
+    for (let i = 0; i < 4; i++) {
+      const k = Math.max(-1, Math.min(1, keyAxes[i]));
+      const value = Math.abs(k) > Math.abs(axes[i]) ? k : axes[i];
+      Atomics.store(v, 1 + i, Math.round(value * 32767));
+    }
+  }
+
+  function inputReady() {
+    input.view = new Int32Array(Module.HEAP32.buffer, Module.ccall('web_input_ptr', 'number', [], []), 8);
+    writeInput();
+  }
+
+  function isTyping(e) { return e.target instanceof HTMLInputElement; }
+  addEventListener('keydown', (e) => {
+    if (isTyping(e) || !(e.code in KEY_BUTTONS || e.code in KEY_AXES)) return;
+    e.preventDefault();
+    input.keys.add(e.code);
+    writeInput();
+  });
+  addEventListener('keyup', (e) => {
+    if (input.keys.delete(e.code)) writeInput();
+  });
+  addEventListener('blur', () => { input.keys.clear(); writeInput(); });
+
+  // 下画面のタッチ: キャンバス全体を -32767..32767 に写す（どこが下画面かはコアが判断する）
+  const canvasEl = document.getElementById('canvas');
+  function setPointer(e, pressed) {
+    const v = input.view;
+    if (!v) return;
+    const r = canvasEl.getBoundingClientRect();
+    const nx = Math.max(-1, Math.min(1, ((e.clientX - r.left) / r.width) * 2 - 1));
+    const ny = Math.max(-1, Math.min(1, ((e.clientY - r.top) / r.height) * 2 - 1));
+    Atomics.store(v, 5, Math.round(nx * 32767));
+    Atomics.store(v, 6, Math.round(ny * 32767));
+    if (pressed !== undefined) Atomics.store(v, 7, pressed ? 1 : 0);
+  }
+  canvasEl.addEventListener('pointerdown', (e) => {
+    canvasEl.setPointerCapture(e.pointerId);
+    setPointer(e, true);
+    e.preventDefault();
+  });
+  canvasEl.addEventListener('pointermove', (e) => { if (e.buttons) setPointer(e); });
+  for (const type of ['pointerup', 'pointercancel']) {
+    canvasEl.addEventListener(type, (e) => setPointer(e, false));
+  }
+
+  function pollGamepads() {
+    let pad = 0;
+    const axes = [0, 0, 0, 0];
+    for (const gp of navigator.getGamepads ? navigator.getGamepads() : []) {
+      if (!gp || gp.mapping !== 'standard') continue;
+      gp.buttons.forEach((b, i) => { if (b.pressed && PAD_BUTTONS[i] >= 0) pad |= 1 << PAD_BUTTONS[i]; });
+      for (let i = 0; i < 4 && i < gp.axes.length; i++) {
+        const x = gp.axes[i];
+        if (Math.abs(x) > 0.15 && Math.abs(x) > Math.abs(axes[i])) axes[i] = x;
+      }
+    }
+    if (pad !== input.pad || axes.some((x, i) => x !== input.padAxes[i])) {
+      input.pad = pad;
+      input.padAxes = axes;
+      writeInput();
+    }
+  }
+
+  // ---- 音声: 共有メモリのリングバッファ（frontend/main.cpp の AudioRing）を AudioWorklet で再生 ----
+  const WORKLET = `
+  class RingPlayer extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.primed = false;
+      this.port.onmessage = (e) => {
+        const { buffer, base } = e.data;
+        this.hdr = new Uint32Array(buffer, base, 8);
+        this.cap = this.hdr[2];
+        this.pcm = new Int16Array(buffer, base + 32, this.cap * 2);
+      };
+    }
+    process(inputs, outputs) {
+      const out = outputs[0];
+      const L = out[0], R = out[1] || out[0];
+      if (!this.hdr) return true;
+      const cap = this.cap, pcm = this.pcm;
+      const w = Atomics.load(this.hdr, 0);
+      let r = Atomics.load(this.hdr, 1);
+      let avail = (w - r) >>> 0;
+      // 溜まりすぎたら古い分を捨てて遅延を抑える
+      if (avail > 4096) { r = (w - 2048) >>> 0; avail = 2048; }
+      // 途切れた後は少し溜まるまで待つ（ぶつぶつ切れるのを減らす）
+      if (!this.primed && avail < 1024) return true;
+      this.primed = true;
+      const n = Math.min(avail, L.length);
+      for (let i = 0; i < n; i++) {
+        const p = ((r + i) % cap) * 2;
+        L[i] = pcm[p] / 32768;
+        R[i] = pcm[p + 1] / 32768;
+      }
+      if (n < L.length) this.primed = false;
+      Atomics.store(this.hdr, 1, (r + n) >>> 0);
+      return true;
+    }
+  }
+  registerProcessor('ring-player', RingPlayer);`;
+  let audio = null;
+  async function startAudio() {
+    if (audio || !input.view) return;
+    const base = Module.ccall('web_audio_ptr', 'number', [], []);
+    const rate = new Uint32Array(Module.HEAP32.buffer, base, 8)[4] || 32728;
+    audio = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' });
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    await audio.audioWorklet.addModule(url);
+    const node = new AudioWorkletNode(audio, 'ring-player', { outputChannelCount: [2] });
+    node.port.postMessage({ buffer: Module.HEAP32.buffer, base });
+    node.connect(audio.destination);
+    await audio.resume();
+  }
+  for (const type of ['pointerdown', 'keydown']) {
+    addEventListener(type, () => { startAudio().catch((e) => log('音声を開始できません: ' + e)); }, true);
+  }
+
+  // ---- 表示の更新とゲームパッドの読み取り（メインスレッドは軽い処理だけ）----
+  const speedEl = document.getElementById('speed');
+  let lastStats = 0;
+  function onFrame(t) {
+    if (input.view) pollGamepads();
+    if (input.view && t - lastStats > 500) {
+      lastStats = t;
+      const speed = Module.ccall('web_get_speed', 'number', [], []);
+      const busy = Module.ccall('web_get_busy', 'number', [], []);
+      if (speed > 0) speedEl.textContent = `速度 ${speed.toFixed(0)}%（処理 ${busy.toFixed(0)}%）`;
+    }
+    requestAnimationFrame(onFrame);
+  }
+  requestAnimationFrame(onFrame);
 </script>
 <script src="azahar_web.js"></script>
 </body>

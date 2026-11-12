@@ -1,9 +1,20 @@
-// 3DS-web: Azahar の libretro コアをブラウザで動かすための最小フロントエンド。
+// 3DS-web: Azahar の libretro コアをブラウザで動かすフロントエンド。
 // Licensed under GPLv2 or any later version (Azahar と同じ)。
 //
-// いまの段階の目的は「リンクが通り、ROM を読み込んで retro_run が回る」こと。
-// 音声と入力は未接続（TODO）。
+// スレッド構成:
+// - ブラウザのメインスレッドは DOM・入力・音声だけを扱い、エミュレーションはしない
+//   （メインスレッドは Atomics.wait ができず、スレッド待ちが空回りするため）
+// - エミュレーションスレッド（pthread）が canvas を OffscreenCanvas として受け取り、
+//   WebGL2 コンテキストを持ち、retro_run を 3DS の速度（約 59.83fps）で回す。
+//   各フレームの後はワーカーのイベントループに戻る（そこで描画が画面に出て、
+//   メインスレッドから委譲された呼び出しも処理される）
+// - JS から呼ぶ web_* 関数のうち、コアに触れるものはエミュレーションスレッドへ委譲する
+//
+// 入力はメインスレッドの JS が共有メモリ（web_input_ptr）へ書き、コアがそれを読む。
+// 音声はコアが共有メモリのリングバッファ（web_audio_ptr）へ書き、AudioWorklet が読む。
 
+#include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -12,9 +23,13 @@
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 #include <libretro.h>
+#include <pthread.h>
 
 // ソフトウェア描画: XRGB8888 を RGBA に並べ替えて 2D キャンバスへ転送する。
+// エミュレーションスレッドで呼ばれ、Module.canvas は移譲された OffscreenCanvas。
 // clang-format off
 EM_JS(void, BlitSoftwareFrame, (const void* data, unsigned width, unsigned height, unsigned pitch), {
     const src = data >>> 2;
@@ -38,6 +53,19 @@ EM_JS(void, BlitSoftwareFrame, (const void* data, unsigned width, unsigned heigh
     }
     st.ctx.putImageData(st.image, 0, 0);
 });
+
+// 次のフレームを delay ms 後に予約する（エミュレーションスレッドのイベントループで実行）。
+// 0 以下なら MessageChannel ですぐに戻ってくる（setTimeout(0) の 4ms 下限を避ける）。
+EM_JS(void, ScheduleTick, (double delay), {
+    let s = Module.__tick;
+    if (!s) {
+        const ch = new MessageChannel();
+        s = Module.__tick = {ch, run: () => _web_tick()};
+        ch.port1.onmessage = s.run;
+    }
+    if (delay <= 0) s.ch.port2.postMessage(0);
+    else setTimeout(s.run, delay);
+});
 // clang-format on
 
 namespace {
@@ -46,6 +74,7 @@ retro_hw_render_callback hw_render{};
 bool hw_render_set = false;
 bool game_loaded = false;
 EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gl_context = 0;
+pthread_t emu_thread{};
 
 const char* const SYSTEM_DIR = "/azahar/system";
 const char* const SAVE_DIR = "/azahar/save";
@@ -143,16 +172,86 @@ void VideoRefresh(const void* data, unsigned width, unsigned height, size_t pitc
     BlitSoftwareFrame(data, width, height, static_cast<unsigned>(pitch));
 }
 
-void AudioSample(int16_t, int16_t) {}
+// ---- 音声: 単一生産者（エミュレーションスレッド）・単一消費者（AudioWorklet）のリング ----
+// web/index.html の AudioWorklet と配置を合わせる（uint32 単位）:
+//   [0] 書き込み位置（フレーム数、単調増加）  [1] 読み出し位置  [2] 容量（フレーム）
+//   [3] 溢れて捨てたフレーム数  [4] 標本化周波数  [8..] int16 ステレオのサンプル
+constexpr uint32_t AUDIO_FRAMES = 16384; // 32728Hz で約 0.5 秒
+struct AudioRing {
+    std::atomic<uint32_t> write;
+    std::atomic<uint32_t> read;
+    uint32_t capacity;
+    std::atomic<uint32_t> dropped;
+    std::atomic<uint32_t> sample_rate;
+    uint32_t pad[3];
+    int16_t samples[AUDIO_FRAMES * 2];
+};
+AudioRing audio_ring{};
 
-size_t AudioSampleBatch(const int16_t*, size_t frames) {
-    return frames; // TODO: Web Audio へ渡す
+size_t AudioSampleBatch(const int16_t* data, size_t frames) {
+    const uint32_t w = audio_ring.write.load(std::memory_order_relaxed);
+    const uint32_t r = audio_ring.read.load(std::memory_order_acquire);
+    const uint32_t space = AUDIO_FRAMES - (w - r);
+    const uint32_t n = frames < space ? static_cast<uint32_t>(frames) : space;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t pos = (w + i) % AUDIO_FRAMES;
+        audio_ring.samples[pos * 2] = data[i * 2];
+        audio_ring.samples[pos * 2 + 1] = data[i * 2 + 1];
+    }
+    audio_ring.write.store(w + n, std::memory_order_release);
+    if (n < frames) {
+        audio_ring.dropped.fetch_add(static_cast<uint32_t>(frames - n), std::memory_order_relaxed);
+    }
+    return frames; // 溢れた分は捨てる（エミュレーションを止めない）
+}
+
+void AudioSample(int16_t left, int16_t right) {
+    const int16_t frame[2] = {left, right};
+    AudioSampleBatch(frame, 1);
+}
+
+// ---- 入力: メインスレッドの JS が Atomics.store で書く（int32 単位）----
+//   [0] ボタンのビットマスク（1 << RETRO_DEVICE_ID_JOYPAD_*）
+//   [1] 左スティック X  [2] 左 Y  [3] 右スティック X  [4] 右 Y（-32767..32767、下が正）
+//   [5] ポインター X  [6] ポインター Y（キャンバス全体を -32767..32767）  [7] 押している
+std::atomic<int32_t> input_state[8]{};
+
+int32_t In(int i) {
+    return input_state[i].load(std::memory_order_relaxed);
 }
 
 void InputPoll() {}
 
-int16_t InputState(unsigned, unsigned, unsigned, unsigned) {
-    return 0; // TODO: キーボード・ゲームパッド・タッチ
+int16_t InputState(unsigned port, unsigned device, unsigned index, unsigned id) {
+    if (port != 0) {
+        return 0;
+    }
+    switch (device) {
+    case RETRO_DEVICE_JOYPAD:
+        if (id == RETRO_DEVICE_ID_JOYPAD_MASK) {
+            return static_cast<int16_t>(In(0) & 0xFFFF);
+        }
+        return id < 16 ? (In(0) >> id) & 1 : 0;
+    case RETRO_DEVICE_ANALOG:
+        if (index <= RETRO_DEVICE_INDEX_ANALOG_RIGHT && id <= RETRO_DEVICE_ID_ANALOG_Y) {
+            return static_cast<int16_t>(In(1 + index * 2 + id));
+        }
+        return 0;
+    case RETRO_DEVICE_POINTER:
+        switch (id) {
+        case RETRO_DEVICE_ID_POINTER_X:
+            return static_cast<int16_t>(In(5));
+        case RETRO_DEVICE_ID_POINTER_Y:
+            return static_cast<int16_t>(In(6));
+        case RETRO_DEVICE_ID_POINTER_PRESSED:
+        case RETRO_DEVICE_ID_POINTER_COUNT:
+            return In(7) != 0;
+        }
+        return 0;
+    case RETRO_DEVICE_MOUSE:
+        return id == RETRO_DEVICE_ID_MOUSE_LEFT ? In(7) != 0 : 0;
+    }
+    return 0;
 }
 
 bool CreateGLContext() {
@@ -166,6 +265,8 @@ bool CreateGLContext() {
     attrs.antialias = false;
     attrs.preserveDrawingBuffer = false;
     attrs.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
+    // canvas はこのスレッドへ OffscreenCanvas として移譲済み。メインスレッドへの委譲はしない
+    attrs.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
 
     gl_context = emscripten_webgl_create_context("#canvas", &attrs);
     if (gl_context <= 0) {
@@ -175,64 +276,80 @@ bool CreateGLContext() {
     return emscripten_webgl_make_context_current(gl_context) == EMSCRIPTEN_RESULT_SUCCESS;
 }
 
-// 速度計測: 直近 60 フレームの retro_run の平均処理時間。
-// 実機は約 59.83fps なので、1 フレーム 16.7ms 以内なら等速。
+// ---- 速度の調整と計測（エミュレーションスレッドだけが触る。結果は atomic で公開）----
+// frame_period_ms ごとに 1 フレーム。間はイベントループで寝る（空回りしない）。
+double frame_period_ms = 1000.0 / 59.8261;
+double next_deadline = 0.0;
+bool tick_scheduled = false;
+
+// 直近 60 フレームの retro_run の平均処理時間（16.7ms 以内なら等速を出せる）
 double frame_ms_sum = 0.0;
 unsigned frame_count = 0;
-double last_avg_frame_ms = 0.0;
-unsigned total_frames = 0;
+std::atomic<double> last_avg_frame_ms{0.0};
+std::atomic<unsigned> total_frames{0};
 
-void MainLoop() {
-    if (!game_loaded) {
-        return;
-    }
+// 約 1 秒ごとの窓: 速度（実機比 %）と、エミュレーションスレッドが retro_run にいた割合（%）
+double window_start = 0.0;
+unsigned window_frames = 0;
+double window_busy_ms = 0.0;
+std::atomic<double> speed_percent{0.0};
+std::atomic<double> busy_percent{0.0};
+
+void Schedule() {
+    tick_scheduled = true;
+    ScheduleTick(next_deadline - emscripten_get_now());
+}
+
+void RunFrame() {
     const double start = emscripten_get_now();
     retro_run();
-    frame_ms_sum += emscripten_get_now() - start;
-    ++total_frames;
+    const double end = emscripten_get_now();
+    const double ms = end - start;
+    frame_ms_sum += ms;
+    window_busy_ms += ms;
+    ++window_frames;
+    total_frames.fetch_add(1, std::memory_order_relaxed);
     if (++frame_count == 60) {
-        last_avg_frame_ms = frame_ms_sum / frame_count;
+        last_avg_frame_ms.store(frame_ms_sum / frame_count, std::memory_order_relaxed);
         frame_ms_sum = 0.0;
         frame_count = 0;
     }
+    const double elapsed = end - window_start;
+    if (elapsed >= 1000.0) {
+        speed_percent.store(window_frames * frame_period_ms / elapsed * 100.0,
+                            std::memory_order_relaxed);
+        busy_percent.store(window_busy_ms / elapsed * 100.0, std::memory_order_relaxed);
+        window_start = end;
+        window_frames = 0;
+        window_busy_ms = 0.0;
+    }
 }
 
-} // namespace
+// ---- エミュレーションスレッドで実行する処理（メインスレッドから委譲される）----
 
-extern "C" {
+struct LoadRequest {
+    const char* path;
+    bool result;
+};
 
-// JS から呼ぶ: コア設定を上書きする（ROM の読み込み前に呼ぶ）。
-EMSCRIPTEN_KEEPALIVE void web_set_option(const char* key, const char* value) {
-    options[key] = value;
-}
-
-// JS から呼ぶ: 直近 60 フレームの平均処理時間（ms）。まだ計測できていなければ 0。
-EMSCRIPTEN_KEEPALIVE double web_get_frame_ms() {
-    return last_avg_frame_ms;
-}
-
-// JS から呼ぶ: 起動してから実行したフレーム数。
-EMSCRIPTEN_KEEPALIVE unsigned web_get_frame_count() {
-    return total_frames;
-}
-
-// JS から呼ぶ: 仮想ファイルシステム上の ROM を読み込んで実行を始める。
-EMSCRIPTEN_KEEPALIVE bool web_load_game(const char* path) {
+void LoadGameOnEmuThread(void* arg) {
+    auto* req = static_cast<LoadRequest*>(arg);
+    req->result = false;
     if (game_loaded) {
         retro_unload_game();
         game_loaded = false;
     }
 
     retro_game_info info{};
-    info.path = path;
+    info.path = req->path;
     if (!retro_load_game(&info)) {
-        std::fprintf(stderr, "retro_load_game に失敗: %s\n", path);
-        return false;
+        std::fprintf(stderr, "retro_load_game に失敗: %s\n", req->path);
+        return;
     }
 
     if (hw_render_set) {
         if (gl_context == 0 && !CreateGLContext()) {
-            return false;
+            return;
         }
         if (hw_render.context_reset) {
             hw_render.context_reset();
@@ -242,16 +359,34 @@ EMSCRIPTEN_KEEPALIVE bool web_load_game(const char* path) {
     retro_system_av_info av{};
     retro_get_system_av_info(&av);
     emscripten_set_canvas_element_size("#canvas", av.geometry.base_width, av.geometry.base_height);
-    std::printf("読み込み完了: %ux%u %.2ffps\n", av.geometry.base_width, av.geometry.base_height,
-                av.timing.fps);
+    if (av.timing.fps > 1.0) {
+        frame_period_ms = 1000.0 / av.timing.fps;
+    }
+    audio_ring.sample_rate.store(static_cast<uint32_t>(std::lround(av.timing.sample_rate)));
+    std::printf("読み込み完了: %ux%u %.2ffps %.0fHz\n", av.geometry.base_width,
+                av.geometry.base_height, av.timing.fps, av.timing.sample_rate);
 
     game_loaded = true;
-    return true;
+    req->result = true;
+    window_start = next_deadline = emscripten_get_now();
+    window_frames = 0;
+    window_busy_ms = 0.0;
+    if (!tick_scheduled) {
+        Schedule();
+    }
 }
 
-} // extern "C"
+struct OptionRequest {
+    const char* key;
+    const char* value;
+};
 
-int main() {
+void SetOptionOnEmuThread(void* arg) {
+    auto* req = static_cast<OptionRequest*>(arg);
+    options[req->key] = req->value;
+}
+
+void* EmuThreadMain(void*) {
     retro_set_environment(Environment);
     retro_set_video_refresh(VideoRefresh);
     retro_set_audio_sample(AudioSample);
@@ -262,8 +397,106 @@ int main() {
 
     retro_system_info sys{};
     retro_get_system_info(&sys);
-    std::printf("%s %s 起動\n", sys.library_name, sys.library_version);
+    std::printf("%s %s 起動（エミュレーションスレッド）\n", sys.library_name, sys.library_version);
 
-    emscripten_set_main_loop(MainLoop, 0, false);
+    // スレッドを終わらせずにイベントループへ戻る。以後は ScheduleTick と委譲された呼び出しで動く
+    emscripten_exit_with_live_runtime();
+}
+
+// メインスレッドから: fn をエミュレーションスレッドで実行し、終わるまで待つ。
+// 待つ間もメインスレッドは委譲されてきた処理（FS など）を実行するので、行き詰まらない。
+void RunOnEmuThread(void (*fn)(void*), void* arg) {
+    if (pthread_equal(pthread_self(), emu_thread)) {
+        fn(arg);
+        return;
+    }
+    if (!emscripten_proxy_sync(emscripten_proxy_get_system_queue(), emu_thread, fn, arg)) {
+        std::fprintf(stderr, "エミュレーションスレッドへの委譲に失敗\n");
+    }
+}
+
+} // namespace
+
+extern "C" {
+
+// エミュレーションスレッドのイベントループから呼ばれる（ScheduleTick）。
+EMSCRIPTEN_KEEPALIVE void web_tick() {
+    tick_scheduled = false;
+    if (!game_loaded) {
+        return;
+    }
+    double now = emscripten_get_now();
+    if (now >= next_deadline) {
+        RunFrame();
+        next_deadline += frame_period_ms;
+        now = emscripten_get_now();
+        // 3 フレーム以上遅れたら追いつくのをあきらめる（遅い端末で連続実行し続けないように）
+        if (now - next_deadline > frame_period_ms * 3) {
+            next_deadline = now;
+        }
+    }
+    Schedule();
+}
+
+// JS から呼ぶ: コア設定を上書きする（ROM の読み込み前に呼ぶ）。
+EMSCRIPTEN_KEEPALIVE void web_set_option(const char* key, const char* value) {
+    OptionRequest req{key, value};
+    RunOnEmuThread(SetOptionOnEmuThread, &req);
+}
+
+// JS から呼ぶ: 直近 60 フレームの retro_run の平均処理時間（ms）。まだ計測できていなければ 0。
+EMSCRIPTEN_KEEPALIVE double web_get_frame_ms() {
+    return last_avg_frame_ms.load(std::memory_order_relaxed);
+}
+
+// JS から呼ぶ: 起動してから実行したフレーム数。
+EMSCRIPTEN_KEEPALIVE unsigned web_get_frame_count() {
+    return total_frames.load(std::memory_order_relaxed);
+}
+
+// JS から呼ぶ: 直近約 1 秒のエミュレーション速度（実機に対する %、100 で等速）。
+EMSCRIPTEN_KEEPALIVE double web_get_speed() {
+    return speed_percent.load(std::memory_order_relaxed);
+}
+
+// JS から呼ぶ: 直近約 1 秒にエミュレーションスレッドが retro_run にいた時間の割合（%）。
+EMSCRIPTEN_KEEPALIVE double web_get_busy() {
+    return busy_percent.load(std::memory_order_relaxed);
+}
+
+// JS から呼ぶ: 入力の共有領域（int32 × 8、配置は input_state の説明を参照）。
+EMSCRIPTEN_KEEPALIVE void* web_input_ptr() {
+    return input_state;
+}
+
+// JS から呼ぶ: 音声のリングバッファ（配置は AudioRing の説明を参照）。
+EMSCRIPTEN_KEEPALIVE void* web_audio_ptr() {
+    return &audio_ring;
+}
+
+// JS から呼ぶ: 仮想ファイルシステム上の ROM を読み込んで実行を始める。
+// 読み込みはエミュレーションスレッドで行い、終わるまでメインスレッドは待つ。
+EMSCRIPTEN_KEEPALIVE bool web_load_game(const char* path) {
+    LoadRequest req{path, false};
+    RunOnEmuThread(LoadGameOnEmuThread, &req);
+    return req.result;
+}
+
+} // extern "C"
+
+int main() {
+    audio_ring.capacity = AUDIO_FRAMES;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    // canvas の制御をエミュレーションスレッドへ移す（WebGL2 / 2D コンテキストはそこで作る）
+    emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
+    const int err = pthread_create(&emu_thread, &attr, EmuThreadMain, nullptr);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        std::fprintf(stderr, "エミュレーションスレッドを作成できません (%d)\n", err);
+        return 1;
+    }
     return 0;
 }

@@ -11,6 +11,9 @@
 //   --seconds <n>           ROM 読み込み後に動かす秒数（既定 10）
 //   --log-lines <n>         ログの末尾を何行返すか（既定 40）
 //   --chromebook            Chromebook 相当の計測（CPU・メモリの制限は laptop-agent.sh が掛ける）
+//
+// 出力の speedPercent は実機比の速度（web_get_speed、旧ビルドでは null）、emuBusyPercent は
+// エミュレーションスレッドが retro_run にいた割合、mainThread* はブラウザのメインスレッドの空き具合。
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { readFile, stat } from 'node:fs/promises';
@@ -107,8 +110,22 @@ try {
       out.exception = String(e && e.stack || e).slice(0, 2000);
     }
     const f0 = (() => { try { return Module.ccall('web_get_frame_count', 'number', [], []); } catch { return 0; } })();
+    // メインスレッドの空き具合: rAF の回数と、50ms を超えたタスク（longtask）の合計時間
+    let rafs = 0, longMs = 0, rafOn = true;
+    const tick = () => { rafs++; if (rafOn) requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+    const po = new PerformanceObserver(l => { for (const e of l.getEntries()) longMs += e.duration; });
+    try { po.observe({ entryTypes: ['longtask'] }); } catch {}
     const s0 = performance.now();
     await new Promise(r => setTimeout(r, seconds * 1000));
+    rafOn = false;
+    po.disconnect();
+    const sec = (performance.now() - s0) / 1000;
+    out.mainThreadRafPerSec = Math.round(rafs / sec * 10) / 10;
+    out.mainThreadLongTaskPercent = Math.round(longMs / (sec * 10));
+    const opt = (name) => { try { return Math.round(Module.ccall(name, 'number', [], []) * 10) / 10; } catch { return null; } };
+    out.speedPercent = opt('web_get_speed');
+    out.emuBusyPercent = opt('web_get_busy');
     try {
       const frames = Module.ccall('web_get_frame_count', 'number', [], []) - f0;
       out.frames = frames;
