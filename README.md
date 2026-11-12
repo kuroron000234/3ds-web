@@ -43,6 +43,8 @@ Licensed under GPL-3.0-or-later (see [License](#ライセンス)).
 ## 遊び方
 
 1. 下の手順でビルドし、`./serve.py 8000` でサーバーを起動する
+   （または `tools/3dsweb` を使う: `tools/3dsweb [ポート]` でバックグラウンド起動（既定 8081）、
+   `tools/3dsweb stop` で停止、`tools/3dsweb status` で確認。`~/.local/bin` にリンクすれば `3dsweb` で呼べます）
 2. `http://localhost:8000/` を開き、ROM ファイルを選ぶ
 
 | 3DS | キーボード |
@@ -97,6 +99,7 @@ Cross-Origin-Embedder-Policy: require-corp
 | `frontend/main.cpp` | libretro コアをブラウザで動かすフロントエンド（スレッド・入力・音声） |
 | `web/index.html` | ページ |
 | `serve.py` | COOP/COEP 付きの確認用サーバー |
+| `tools/3dsweb` | `serve.py` をバックグラウンドで起動・停止するコマンド |
 | `tools/font/` | 代替システムフォントに足す字形を生成したスクリプト |
 | `tools/`, `remote.sh`, `AGENTS.md`, `statusline.sh` | 開発に使った補助スクリプトとメモ（作者の環境向け） |
 

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# 3DS-web の確認用サーバー（serve.py）をバックグラウンドで起動・停止する。
+# 使い方: 3dsweb [ポート]     起動する（既定 8081）
+#         3dsweb stop [ポート] 止める（ポートを省くとすべて）
+#         3dsweb status       動いているサーバーを表示する
+# ~/.local/bin などにシンボリックリンクを置いて使う。
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
+RUN_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/3dsweb"
+DEFAULT_PORT=8081
+mkdir -p "$RUN_DIR"
+
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+stop_one() {
+    local pidfile="$RUN_DIR/$1.pid"
+    if alive "$pidfile"; then
+        kill "$(cat "$pidfile")" && echo "停止しました（ポート $1）"
+    else
+        echo "ポート $1 では動いていません"
+    fi
+    rm -f "$pidfile"
+}
+
+case "${1:-}" in
+stop)
+    if [ -n "${2:-}" ]; then
+        stop_one "$2"
+    else
+        found=0
+        for f in "$RUN_DIR"/*.pid; do
+            [ -e "$f" ] || continue
+            found=1
+            stop_one "$(basename "$f" .pid)"
+        done
+        [ "$found" = 1 ] || echo "動いているサーバーはありません"
+    fi
+    ;;
+status)
+    found=0
+    for f in "$RUN_DIR"/*.pid; do
+        [ -e "$f" ] || continue
+        port=$(basename "$f" .pid)
+        if alive "$f"; then
+            echo "実行中: http://localhost:$port/（PID $(cat "$f")）"
+            found=1
+        else
+            rm -f "$f"
+        fi
+    done
+    [ "$found" = 1 ] || echo "動いているサーバーはありません"
+    ;;
+-h | --help | help)
+    sed -n '3,5p' "$SELF" | sed 's/^# \{0,1\}//'
+    ;;
+*)
+    port="${1:-$DEFAULT_PORT}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "ポート番号が正しくありません: $port（使い方: 3dsweb [ポート] / 3dsweb stop）" >&2
+        exit 1
+    fi
+    pidfile="$RUN_DIR/$port.pid"
+    if alive "$pidfile"; then
+        echo "すでに起動しています: http://localhost:$port/（止めるには 3dsweb stop $port）"
+        exit 0
+    fi
+    if [ ! -f "$REPO/web/azahar_web.wasm" ] && [ ! -f "${WORK:-/tmp/3ds}/build/bin/Release/azahar_web.wasm" ]; then
+        echo "ビルド成果物がありません。先に $REPO/bootstrap.sh build を実行してください" >&2
+        exit 1
+    fi
+    log="$RUN_DIR/$port.log"
+    nohup python3 "$REPO/serve.py" "$port" >"$log" 2>&1 &
+    echo $! >"$pidfile"
+    sleep 0.5
+    if ! alive "$pidfile"; then
+        rm -f "$pidfile"
+        echo "起動できませんでした（ポート $port が使用中かもしれません）:" >&2
+        tail -3 "$log" >&2
+        exit 1
+    fi
+    echo "起動しました: http://localhost:$port/（止めるには 3dsweb stop）"
+    ;;
+esac
