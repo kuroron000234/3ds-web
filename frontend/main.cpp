@@ -479,9 +479,22 @@ extern "C" double web_prof_ms[4];
 double prof_last[3]{};
 std::atomic<double> prof_percent[3]{};
 
+// タイマーは遅れて起きることがある（入れ子の setTimeout は 4ms に丸められ、コアの少ない端末では
+// さらに遅れる）ので、締め切りの少し手前で起こし、残りは web_tick の中で正確に待つ。
+constexpr double TIMER_SLACK_MS = 3.0;
+
+// 遅れているのに retro_run の外で過ごした時間（イベントループの往復と画面の確定）。
+// 「処理 %」に入らないのに速度を落とす分なので、別に測って公開する。
+double tick_posted_at = 0.0;
+double window_overhead_ms = 0.0;
+std::atomic<double> overhead_percent{0.0};
+
 void Schedule() {
     tick_scheduled = true;
-    ScheduleTick(next_deadline - emscripten_get_now());
+    const double now = emscripten_get_now();
+    const double delay = next_deadline - now;
+    tick_posted_at = delay <= 0.0 ? now : 0.0;
+    ScheduleTick(delay - TIMER_SLACK_MS);
 }
 
 void RunFrame() {
@@ -503,6 +516,8 @@ void RunFrame() {
         speed_percent.store(window_frames * frame_period_ms / elapsed * 100.0,
                             std::memory_order_relaxed);
         busy_percent.store(window_busy_ms / elapsed * 100.0, std::memory_order_relaxed);
+        overhead_percent.store(window_overhead_ms / elapsed * 100.0, std::memory_order_relaxed);
+        window_overhead_ms = 0.0;
         for (int i = 0; i < 3; ++i) {
             prof_percent[i].store((web_prof_ms[i] - prof_last[i]) / elapsed * 100.0,
                                   std::memory_order_relaxed);
@@ -644,16 +659,27 @@ EMSCRIPTEN_KEEPALIVE void web_tick() {
         return;
     }
     double now = emscripten_get_now();
-    if (now >= next_deadline) {
+    if (tick_posted_at > 0.0) {
+        window_overhead_ms += now - tick_posted_at;
+    }
+    // 締め切りまであと少しなら、タイマーに戻さずここで正確に待つ
+    if (now < next_deadline && next_deadline - now <= TIMER_SLACK_MS + 1.0) {
+        emscripten_thread_sleep(next_deadline - now);
+        now = emscripten_get_now();
+    }
+    // 遅れているときは続けて進める。画面はイベントループへ戻ったときに 1 回だけ確定されるので、
+    // 確定の費用が減る（3DS のゲームは 30fps が多く、間のフレームは同じ絵のことが多い）。
+    constexpr int MAX_FRAMES_PER_TICK = 3;
+    for (int i = 0; i < MAX_FRAMES_PER_TICK && now >= next_deadline; ++i) {
         if (!GuardCore("実行", RunFrame)) {
             return;
         }
         next_deadline += frame_period_ms;
         now = emscripten_get_now();
-        // 3 フレーム以上遅れたら追いつくのをあきらめる（遅い端末で連続実行し続けないように）
-        if (now - next_deadline > frame_period_ms * 3) {
-            next_deadline = now;
-        }
+    }
+    // 大きく遅れたら追いつくのをあきらめる（遅い端末で借りを溜め続けないように）
+    if (now - next_deadline > frame_period_ms * 6) {
+        next_deadline = now;
     }
     Schedule();
 }
@@ -684,9 +710,12 @@ EMSCRIPTEN_KEEPALIVE double web_get_busy() {
     return busy_percent.load(std::memory_order_relaxed);
 }
 
-// JS から呼ぶ: 直近約 1 秒の内訳（%）。0 = GPU コマンド処理、1 = 画面出力、2 = 音声。
+// JS から呼ぶ: 直近約 1 秒の内訳（%）。0 = GPU コマンド処理、1 = 画面出力、2 = 音声、3 = 処理の外で失った分。
 // web_get_busy からこの 3 つを引いた残りが CPU コア（インタプリタと OS の HLE）。
 EMSCRIPTEN_KEEPALIVE double web_get_prof(int slot) {
+    if (slot == 3) {
+        return overhead_percent.load(std::memory_order_relaxed); // 遅れている間の retro_run の外
+    }
     return slot >= 0 && slot < 3 ? prof_percent[slot].load(std::memory_order_relaxed) : 0.0;
 }
 

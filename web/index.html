@@ -565,11 +565,12 @@
       const speed = Module.ccall('web_get_speed', 'number', [], []);
       const busy = Module.ccall('web_get_busy', 'number', [], []);
       // 内訳: 描画 = GPU コマンド処理 + 画面出力、CPU = 残り（インタプリタと OS の処理）
-      const prof = [0, 1, 2].map((i) => Module.ccall('web_get_prof', 'number', ['number'], [i]));
+      const prof = [0, 1, 2, 3].map((i) => Module.ccall('web_get_prof', 'number', ['number'], [i]));
       const cpu = Math.max(0, busy - prof[0] - prof[1] - prof[2]);
       if (speed > 0) {
         speedEl.textContent = `速度 ${speed.toFixed(0)}%（処理 ${busy.toFixed(0)}%: CPU ${cpu.toFixed(0)}` +
-          ` / 描画 ${(prof[0] + prof[1]).toFixed(0)} / 音声 ${prof[2].toFixed(0)}）`;
+          ` / 描画 ${(prof[0] + prof[1]).toFixed(0)} / 音声 ${prof[2].toFixed(0)}）` +
+          (prof[3] >= 1 ? ` + 外 ${prof[3].toFixed(0)}%` : '');
       }
     }
     requestAnimationFrame(onFrame);
