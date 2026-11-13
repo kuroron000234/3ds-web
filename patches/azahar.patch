@@ -368,10 +368,10 @@ index bb1d46451..d725780f9 100644
      InterpreterState state_;
 diff --git a/src/core/arm/fastinterp/fastinterp_jit_web.cpp b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
 new file mode 100644
-index 000000000..4d9876a29
+index 000000000..bda934916
 --- /dev/null
 +++ b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
-@@ -0,0 +1,2707 @@
+@@ -0,0 +1,2736 @@
 +// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
 +// Licensed under GPLv2 or any later version
 +// Refer to the misc/licenses/gplv2.txt file included.
@@ -1325,6 +1325,7 @@ index 000000000..4d9876a29
 +        case Opcode::Mul:
 +        case Opcode::Mla:
 +        case Opcode::Clz:
++        case Opcode::Mrc: // the thread-local storage pointers
 +            return i.rd != 15;
 +        case Opcode::Vmrs: // rt == 15 moves the comparison flags to the CPSR
 +        case Opcode::VmovImmS:
@@ -1443,6 +1444,9 @@ index 000000000..4d9876a29
 +        case Opcode::MulS:
 +        case Opcode::MlaS:
 +            return i.rd != 15 ? 2 : 0;
++        case Opcode::Msr:
++            // Without the control byte it cannot change the mode or the instruction set
++            return !(i.dp.flags & 0x01) ? 2 : 0;
 +        case Opcode::Umull:
 +        case Opcode::UmullS:
 +        case Opcode::Umlal:
@@ -1486,6 +1490,8 @@ index 000000000..4d9876a29
 +            return;
 +        }
 +        switch (i.opcode) {
++        case Opcode::Msr:
++            break;
 +        case Opcode::MulS:
 +        case Opcode::MlaS:
 +            ReloadReg(i.rd);
@@ -1937,6 +1943,19 @@ index 000000000..4d9876a29
 +            e.Op(Mul);
 +            LoadReg(i.mul.rn);
 +            e.Op(Add);
++            EndStore(i.rd);
++            break;
++        case Opcode::Mrc:
++            BeginStore(i.rd);
++            if (i.dp.rn == 13 && i.dp.shift_imm == 0 && i.dp.rm == 0 && i.dp.imm == 2) {
++                e.Ptr(&state.cp15_thread_uprw);
++                e.Mem(I32Load, 2);
++            } else if (i.dp.rn == 13 && i.dp.shift_imm == 0 && i.dp.rm == 0 && i.dp.imm == 3) {
++                e.Ptr(&state.cp15_thread_uro);
++                e.Mem(I32Load, 2);
++            } else {
++                e.Const(0);
++            }
 +            EndStore(i.rd);
 +            break;
 +        case Opcode::Clz:
@@ -2691,6 +2710,16 @@ index 000000000..4d9876a29
 +        const u32 bits = state_.vfp_regs[sm];
 +        SetD(sd, (inst->vfp.flags & 1) ? static_cast<double>(bits)
 +                                       : static_cast<double>(static_cast<s32>(bits)));
++        break;
++    }
++    case Opcode::Msr: {
++        const u32 value = (inst->dp.rm != 0xFF) ? state_.regs[inst->dp.rm] : inst->dp.imm;
++        u32 mask = 0;
++        if (inst->dp.flags & 0x01) mask |= 0x000000FF;
++        if (inst->dp.flags & 0x02) mask |= 0x0000FF00;
++        if (inst->dp.flags & 0x04) mask |= 0x00FF0000;
++        if (inst->dp.flags & 0x08) mask |= 0xFF000000;
++        state_.SetCPSR((state_.GetCPSR() & ~mask) | (value & mask));
 +        break;
 +    }
 +    case Opcode::MulS:

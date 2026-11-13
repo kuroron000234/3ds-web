@@ -135,6 +135,24 @@ NOINLINE static u32 pairwork(struct Pair* p, int n) {
     return (u32)s ^ (u32)(s >> 32);
 }
 
+// フラグの直接書き込み（msr cpsr_f）と読み出し、スレッドローカル領域のポインタ（mrc p15）
+NOINLINE static u32 flagsio(u32 v) {
+    u32 r, t;
+    __asm__ volatile(
+        "msr cpsr_f, %2\n"
+        "movcs %0, #1\n"
+        "movcc %0, #2\n"
+        "addeq %0, %0, #4\n"
+        "addmi %0, %0, #8\n"
+        "addvs %0, %0, #16\n"
+        "mrs %1, cpsr\n"
+        "eor %0, %0, %1, lsr #28\n"
+        "mrc p15, 0, %1, c13, c0, 3\n"
+        "add %0, %0, %1\n"
+        : "=&r"(r), "=&r"(t) : "r"(v) : "cc");
+    return r;
+}
+
 void _start(void) {
     for (int i = 0; i < 64; i++) {
         fa[i] = (float)(int)(rng() & 0xFFFF) * (1.0f / 32768.0f) - 1.0f;
@@ -154,6 +172,7 @@ void _start(void) {
         for (u32 i = 0; i < 64; i++) s = fns[(s >> 4) & 3](s, ia[i]);
         s += recurse(12 + (s & 7), s);
         s ^= pairwork(pairs, 16);
+        for (u32 i = 0; i < 32; i++) s = s * 5 + flagsio(ia[i] ^ (s << 7));
         sink = s;
         if (++report.iterations == CHECKPOINT) report.checkpoint = sink;
     }
