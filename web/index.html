@@ -575,12 +575,15 @@
       if (speed > 0) {
         speedEl.textContent = `速度 ${speed.toFixed(0)}%（処理 ${busy.toFixed(0)}%: CPU ${cpu.toFixed(0)}` +
           ` / 描画 ${(prof[0] + prof[1]).toFixed(0)} / 音声 ${prof[2].toFixed(0)}）` +
-          (prof[3] >= 1 ? ` + 外 ${prof[3].toFixed(0)}%` : '');
+          (prof[3] >= 1 ? ` + 外 ${prof[3].toFixed(0)}%` : '') +
+          (jitEl.checked ? ` JIT ${Module.ccall('web_jit_coverage', 'number', [], []).toFixed(0)}%` : '');
       }
     }
     requestAnimationFrame(onFrame);
   }
   requestAnimationFrame(onFrame);
+  // JIT の集計（変換できた割合と、変換を妨げている命令の番号）を 1 分ごとにログへ出す
+  setInterval(() => { if (input.view && jitEl.checked) Module.ccall('web_jit_report', null, [], []); }, 60000);
 </script>
 <script src="azahar_web.js"></script>
 </body>

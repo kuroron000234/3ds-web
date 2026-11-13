@@ -73,7 +73,9 @@ const browser = await chromium.launch({
   executablePath: process.env.WEBTEST_CHROME || '/usr/bin/google-chrome',
   headless: true,
   // Cloud Shell には GPU が無いので、既定の SwiftShader（CPU 描画）に任せる
-  args: process.env.WEBTEST_NO_GPU ? [] : ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=gl-egl'],
+  // WEBTEST_JS_FLAGS: V8 のフラグ（例 --no-liftoff）。原因の切り分け用
+  args: [...(process.env.WEBTEST_NO_GPU ? [] : ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=gl-egl']),
+    ...(process.env.WEBTEST_JS_FLAGS ? ['--js-flags=' + process.env.WEBTEST_JS_FLAGS] : [])],
 });
 const result = { agent: opts.agent, rom: opts.rom, graphics: opts.graphics, chromebook: opts.chromebook };
 try {
@@ -140,6 +142,8 @@ try {
     try {
       out.profPercent = [0, 1, 2, 3].map(i => Math.round(Module.ccall('web_get_prof', 'number', ['number'], [i]) * 10) / 10);
       out.jitFunctions = Module.ccall('web_jit_function_count', 'number', [], []);
+      out.jitCoveragePercent = Math.round(Module.ccall('web_jit_coverage', 'number', [], []));
+      Module.ccall('web_jit_report', null, [], []);
       // tools/cpubench の記録: 周回数（速度の指標）と途中のチェックサム（正しさの確認）
       if (Module.ccall('web_peek32', 'number', ['number'], [0x00102000]) === 0x42454E43) {
         out.benchIterations = Module.ccall('web_peek32', 'number', ['number'], [0x00102004]);

@@ -45,7 +45,7 @@ index ba8cae289..ed645575e 100644
          FinishPendingSleep();
          sleep_reply_frames = 2;
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
-index e28f9941b..49aaa618f 100644
+index e28f9941b..b1d17d1a1 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
 @@ -99,3 +99,35 @@ else()
@@ -77,7 +77,7 @@ index e28f9941b..49aaa618f 100644
 +            -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
 +            -sPTHREAD_POOL_SIZE=11 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
-+            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_get_prof,_web_jit_set_enabled,_web_jit_function_count,_web_peek32,_web_input_ptr,_web_audio_ptr,_web_tick
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_get_prof,_web_jit_set_enabled,_web_jit_function_count,_web_jit_coverage,_web_jit_report,_web_peek32,_web_input_ptr,_web_audio_ptr,_web_tick
 +            # Name the C++ exception and the functions on its stack when a thread dies of one
 +            --pre-js ${WEB_FRONTEND_DIR}/pre.js
 +            -sEXCEPTION_STACK_TRACES -sEXPORT_EXCEPTION_HANDLING_HELPERS --profiling-funcs
@@ -255,10 +255,33 @@ index 814863e52..0cde3e591 100644
  
  if (CITRA_USE_PRECOMPILED_HEADERS)
 diff --git a/src/core/arm/fastinterp/fastinterp.cpp b/src/core/arm/fastinterp/fastinterp.cpp
-index cd24691b6..9487062f9 100644
+index cd24691b6..4a14dd0c9 100644
 --- a/src/core/arm/fastinterp/fastinterp.cpp
 +++ b/src/core/arm/fastinterp/fastinterp.cpp
-@@ -527,6 +527,7 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+@@ -21,6 +21,12 @@ namespace Core::FastInterp {
+ // this zero-initialized array (8MB of BSS nullptrs, zero-fill-on-demand, touched
+ // only if the guest runs without a page table), so the MEM_* fast paths and the
+ // unmapped-PC check never need a null test on the array itself.
++#ifdef __EMSCRIPTEN__
++// Coverage counters of the WebAssembly block compiler (fastinterp_jit_web.cpp)
++extern "C" unsigned long long web_jit_ticks;
++extern "C" unsigned long long web_total_ticks;
++#endif
++
+ static u8* empty_page_table[1 << (32 - FASTINTERP_PAGE_BITS)];
+ 
+ // Included inside the namespace: the macros reference LazyFlags and CondPassed.
+@@ -118,6 +124,9 @@ void ARM_FastInterp::Run() {
+         // flush inside their handler and return executed==0, so they are not double-counted.
+         if (executed > 0) {
+             timer->AddTicks(executed);
++#ifdef __EMSCRIPTEN__
++            web_total_ticks += executed;
++#endif
+         }
+     }
+ }
+@@ -527,6 +536,7 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
          // PC-source elimination
          HANDLER(LdrLit),
          HANDLER(PcSetup),
@@ -266,7 +289,7 @@ index cd24691b6..9487062f9 100644
      };
  #undef HANDLER
  
-@@ -786,6 +787,24 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+@@ -786,6 +796,25 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
  #include "handlers/fused.inc"
      // clang-format on
  
@@ -276,6 +299,7 @@ index cd24691b6..9487062f9 100644
 +    // wrote the target to regs[15]). Otherwise it executed all `count` instructions.
 +    const u32 jit_result = reinterpret_cast<u32 (*)()>(inst->jit.fn)();
 +    executed += jit_result >> 1;
++    web_jit_ticks += jit_result >> 1;
 +    if (jit_result & 1) {
 +        SET_PC(state_.regs[15]);
 +        goto chain;
@@ -291,7 +315,7 @@ index cd24691b6..9487062f9 100644
  chain:
      SYNC_PC();
  
-@@ -847,6 +866,9 @@ done:
+@@ -847,6 +876,9 @@ done:
          fusion_stats_.hot_blocks_detected++;
          if (!disable_reoptimization_) {
              ReoptimizeHotBlock(block);
@@ -301,27 +325,48 @@ index cd24691b6..9487062f9 100644
          }
      }
  
+@@ -1007,11 +1039,17 @@ u32 ARM_FastInterp::ReadMemory32(u32 addr) {
+ // ============================================================================
+ 
+ void ARM_FastInterp::ClearInstructionCache() {
++#ifdef __EMSCRIPTEN__
++    JitClear();
++#endif
+     cache_.Clear();
+ }
+ 
+ void ARM_FastInterp::InvalidateCacheRange(u32 start_address, std::size_t length) {
+     cache_.InvalidateRange(start_address, static_cast<u32>(length));
++#ifdef __EMSCRIPTEN__
++    JitInvalidate(start_address, length);
++#endif
+ }
+ 
+ void ARM_FastInterp::ClearExclusiveState() {
 diff --git a/src/core/arm/fastinterp/fastinterp.h b/src/core/arm/fastinterp/fastinterp.h
-index bb1d46451..2561ae573 100644
+index bb1d46451..4ee8a106b 100644
 --- a/src/core/arm/fastinterp/fastinterp.h
 +++ b/src/core/arm/fastinterp/fastinterp.h
-@@ -111,6 +111,10 @@ private:
+@@ -111,6 +111,13 @@ private:
  
      /// Reoptimize a hot block (apply additional optimizations after detection)
      void ReoptimizeHotBlock(BasicBlock* block);
 +#ifdef __EMSCRIPTEN__
 +    /// Compile the translatable runs of a hot block to WebAssembly (fastinterp_jit_web.cpp)
 +    void JitCompileBlock(BasicBlock* block);
++    bool JitCompileRegion(BasicBlock* root);
++    void JitInvalidate(u32 start, u64 length);
++    void JitClear();
 +#endif
  
      Memory::MemorySystem& memory_;
      InterpreterState state_;
 diff --git a/src/core/arm/fastinterp/fastinterp_jit_web.cpp b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
 new file mode 100644
-index 000000000..93561daf1
+index 000000000..9854e32de
 --- /dev/null
 +++ b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
-@@ -0,0 +1,1088 @@
+@@ -0,0 +1,1406 @@
 +// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
 +// Licensed under GPLv2 or any later version
 +// Refer to the misc/licenses/gplv2.txt file included.
@@ -342,6 +387,9 @@ index 000000000..93561daf1
 +
 +#ifdef __EMSCRIPTEN__
 +
++#include <algorithm>
++#include <array>
++#include <cstdio>
 +#include <vector>
 +#include <emscripten.h>
 +#include "common/logging/log.h"
@@ -354,11 +402,30 @@ index 000000000..93561daf1
 +
 +bool jit_enabled = true;
 +u32 jit_functions = 0;
++u32 hot_blocks = 0;
++u32 hot_instructions = 0;
++u32 unsupported_instructions = 0;
++std::array<u32, 512> unsupported{};
 +constexpr u32 MAX_JIT_FUNCTIONS = 200000;
 +constexpr u32 MIN_RUN_LENGTH = 3;
 +constexpr u32 MIN_BRANCH_RUN_LENGTH = 2;
 +// Iterations of a self-loop per call (the interpreter chains at most 16 blocks per slice check)
 +constexpr u32 MAX_LOOP_ITERATIONS = 16;
++// A region is a group of blocks compiled into one function so that branches between them stay
++// inside the compiled code instead of returning to the interpreter
++constexpr u32 MAX_REGION_BLOCKS = 12;
++constexpr u32 MAX_REGION_INSTRUCTIONS = 160;
++// Block-to-block transfers inside a region per call (bounds how late a timer slice can end)
++constexpr u32 MAX_REGION_TRANSFERS = 32;
++
++// Compiled regions, for invalidation when guest code changes
++struct RegionRecord {
++    const void* owner;
++    u32 root_pc;
++    u32 low;
++    u32 high;
++};
++std::vector<RegionRecord> regions;
 +
 +// Helpers the generated code reaches through the function table (call_indirect).
 +u32 JitCond(LazyFlags* flags, u32 cond) {
@@ -393,7 +460,10 @@ index 000000000..93561daf1
 +// LFA/LFO/LFR keep the operands and result of the last flag-setting instruction so that a
 +// following condition can be evaluated without materializing the flags. LT/LN: loop ticks/count.
 +enum : u8 { LA = 0, LO = 1, LR = 2, LP = 3, LC = 4, LFA = 5, LFO = 6, LFR = 7, LT = 8, LN = 9 };
-+constexpr u8 NUM_LOCALS = 10;
++// Guest registers r0-r14 live in locals LREG..LREG+14 for the duration of a run
++constexpr u8 LNEXT = 10; // Region dispatch: index of the block to run next
++constexpr u8 LREG = 11;
++constexpr u8 NUM_LOCALS = LREG + 15;
 +
 +class Emitter {
 +public:
@@ -476,6 +546,8 @@ index 000000000..93561daf1
 +    // What the generated code knows about the flags at this point (compile-time state)
 +    enum class Known { Nothing, Sub, Result };
 +    Known known = Known::Nothing;
++    std::vector<u32> region_pcs; // Region mode: start addresses of the member blocks
++    u32 region_block = 0;        // Region mode: index of the block being emitted
 +    bool in_loop = false;     // The run is wrapped in a loop (it branches to its own start)
 +    u32 loop_target = 0;      // Guest address of the loop head
 +    u32 ticks_done = 0;       // Ticks of the instructions emitted so far, including the current
@@ -529,6 +601,38 @@ index 000000000..93561daf1
 +    // Emitted where a branch is taken: write the target and leave, or go round the loop again.
 +    // Must be called inside exactly one `if`.
 +    void TakeBranch(u32 target, bool to_start) {
++        if (!region_pcs.empty()) {
++            const auto it = std::find(region_pcs.begin(), region_pcs.end(), target);
++            if (it != region_pcs.end()) {
++                // Stay inside the region: account the ticks and dispatch to the target block,
++                // unless this call has already made its share of transfers
++                e.Get(LT);
++                e.Const(ticks_done);
++                e.Op(Add);
++                e.Set(LT);
++                e.Get(LN);
++                e.Const(1);
++                e.Op(Add);
++                e.Tee(LN);
++                e.Const(MAX_REGION_TRANSFERS);
++                e.Op(LtU);
++                e.Op(If);
++                e.Op(BlockVoid);
++                e.Const(static_cast<u32>(it - region_pcs.begin()));
++                e.Set(LNEXT);
++                e.Byte(0x0C); // br to the dispatch loop: two `if`s, then the enclosing blocks
++                e.U32(2 + static_cast<u32>(region_pcs.size()) - 1 - region_block);
++                e.Op(End);
++                Flush(e);
++                e.Ptr(&state.regs[15]);
++                e.Const(target);
++                e.Mem(I32Store, 2);
++                e.Get(LT);
++                Exit();
++                return;
++            }
++            to_start = false;
++        }
 +        if (in_loop && to_start) {
 +            e.Get(LT);
 +            e.Const(ticks_done);
@@ -542,11 +646,13 @@ index 000000000..93561daf1
 +            e.Op(LtU);
 +            e.Op(BrIf);
 +            e.Byte(1); // the enclosing `if` is depth 0, the loop depth 1
++            Flush(e);
 +            e.Ptr(&state.regs[15]);
 +            e.Const(target);
 +            e.Mem(I32Store, 2);
 +            e.Get(LT);
 +        } else {
++            Flush(e);
 +            e.Ptr(&state.regs[15]);
 +            e.Const(target);
 +            e.Mem(I32Store, 2);
@@ -565,9 +671,45 @@ index 000000000..93561daf1
 +        e.Op(Return);
 +    }
 +
++    // Registers r0-r14 are loaded into locals when the run starts and the ones it may write are
++    // stored back wherever it leaves (and before slow-path calls). r15 is not cached: inside a
++    // block it only holds what PcSetup or a taken branch wrote.
++    u32 used_regs = 0;    // Registers the run reads or writes (collected in the first pass)
++    u32 written_regs = 0; // Registers the run may write
++    u32 flush_regs = 0;   // written_regs of the first pass: what an exit has to store
++
 +    void LoadReg(u8 r) {
-+        e.Ptr(&state.regs[r]);
-+        e.Mem(I32Load, 2);
++        if (r >= 15) {
++            e.Ptr(&state.regs[15]);
++            e.Mem(I32Load, 2);
++            return;
++        }
++        used_regs |= 1u << r;
++        e.Get(LREG + r);
++    }
++    void BeginStore(u8 r) {
++        if (r >= 15) {
++            e.Ptr(&state.regs[15]);
++        }
++    }
++    void EndStore(u8 r) {
++        if (r >= 15) {
++            e.Mem(I32Store, 2);
++            return;
++        }
++        used_regs |= 1u << r;
++        written_regs |= 1u << r;
++        e.Set(LREG + r);
++    }
++    // Stores the registers the run may have written back to the interpreter state
++    void Flush(Emitter& out) const {
++        for (u8 r = 0; r < 15; ++r) {
++            if (flush_regs & (1u << r)) {
++                out.Ptr(&state.regs[r]);
++                out.Get(LREG + r);
++                out.Mem(I32Store, 2);
++            }
++        }
 +    }
 +
 +    // Pushes value << / >> amount with ShiftNoCarry semantics. Returns false for RRX.
@@ -679,7 +821,7 @@ index 000000000..93561daf1
 +
 +    // regs[rd] = read(LA)
 +    void Read(u8 rd, u8 size, bool sign) {
-+        e.Ptr(&state.regs[rd]);
++        BeginStore(rd);
 +        PagePointer();
 +        e.Op(If);
 +        e.Op(BlockI32);
@@ -689,6 +831,7 @@ index 000000000..93561daf1
 +                                    : (sign ? I32Load8S : I32Load8U),
 +              0);
 +        e.Op(Else);
++        Flush(e); // the slow path may inspect the CPU state
 +        e.Ptr(memory);
 +        e.Get(LA);
 +        if (size == 4) {
@@ -705,7 +848,7 @@ index 000000000..93561daf1
 +            }
 +        }
 +        e.Op(End);
-+        e.Mem(I32Store, 2);
++        EndStore(rd);
 +    }
 +
 +    // write(LA, regs[rd])
@@ -717,6 +860,7 @@ index 000000000..93561daf1
 +        LoadReg(rd);
 +        e.Mem(size == 4 ? I32Store : size == 2 ? I32Store16 : I32Store8, 0);
 +        e.Op(Else);
++        Flush(e);
 +        e.Ptr(memory);
 +        e.Get(LA);
 +        LoadReg(rd);
@@ -759,16 +903,16 @@ index 000000000..93561daf1
 +            e.Get(LO);
 +            e.Op(Add);
 +            e.Set(LA);
-+            e.Ptr(&state.regs[i.ls.rn]);
++            BeginStore(i.ls.rn);
 +            e.Get(LA);
-+            e.Mem(I32Store, 2);
++            EndStore(i.ls.rn);
 +            break;
 +        case AddrMode::PostIndex:
-+            e.Ptr(&state.regs[i.ls.rn]);
++            BeginStore(i.ls.rn);
 +            e.Get(LA);
 +            e.Get(LO);
 +            e.Op(Add);
-+            e.Mem(I32Store, 2);
++            EndStore(i.ls.rn);
 +            break;
 +        }
 +    }
@@ -860,9 +1004,9 @@ index 000000000..93561daf1
 +        }
 +        e.Set(LR);
 +        if (writeback) {
-+            e.Ptr(&state.regs[i.rd]);
++            BeginStore(i.rd);
 +            e.Get(LR);
-+            e.Mem(I32Store, 2);
++            EndStore(i.rd);
 +        }
 +        FinishArithmetic(op);
 +    }
@@ -897,9 +1041,9 @@ index 000000000..93561daf1
 +        e.Op(Sub);
 +        e.Set(LR);
 +        if (writeback) {
-+            e.Ptr(&state.regs[i.rd]);
++            BeginStore(i.rd);
 +            e.Get(LR);
-+            e.Mem(I32Store, 2);
++            EndStore(i.rd);
 +        }
 +        FinishArithmetic(writeback ? FlagOp::Sub : FlagOp::Cmp);
 +        Cond(i.fused.branch_cond);
@@ -930,9 +1074,9 @@ index 000000000..93561daf1
 +        }
 +        e.Set(LR);
 +        if (writeback) {
-+            e.Ptr(&state.regs[i.rd]);
++            BeginStore(i.rd);
 +            e.Get(LR);
-+            e.Mem(I32Store, 2);
++            EndStore(i.rd);
 +        }
 +        SetFlagOp(op);
 +        StoreFlagField(&state.lazy_flags.result, LR);
@@ -944,7 +1088,7 @@ index 000000000..93561daf1
 +
 +    // kind as in Logical, plus 6 = add, 7 = sub, 8 = rsb
 +    void Plain(const DecodedInst& i, int kind) {
-+        e.Ptr(&state.regs[i.rd]);
++        BeginStore(i.rd);
 +        if (kind == 8) {
 +            Op2(i, false);
 +            LoadReg(i.dp.rn);
@@ -977,7 +1121,7 @@ index 000000000..93561daf1
 +                break;
 +            }
 +        }
-+        e.Mem(I32Store, 2);
++        EndStore(i.rd);
 +    }
 +
 +    static bool IsBranch(const DecodedInst& i) {
@@ -1019,7 +1163,7 @@ index 000000000..93561daf1
 +    }
 +
 +    void Extend(const DecodedInst& i, int kind) {
-+        e.Ptr(&state.regs[i.rd]);
++        BeginStore(i.rd);
 +        LoadReg(i.dp.rm);
 +        if ((i.dp.shift_imm & 31) != 0) {
 +            e.Const(i.dp.shift_imm & 31);
@@ -1041,7 +1185,7 @@ index 000000000..93561daf1
 +            e.Op(0xC1); // i32.extend16_s
 +            break;
 +        }
-+        e.Mem(I32Store, 2);
++        EndStore(i.rd);
 +    }
 +
 +    void Body(const DecodedInst& i, u32 block_start) {
@@ -1061,11 +1205,11 @@ index 000000000..93561daf1
 +            Extend(i, 3);
 +            break;
 +        case Opcode::Mul:
-+            e.Ptr(&state.regs[i.rd]);
++            BeginStore(i.rd);
 +            LoadReg(i.mul.rm);
 +            LoadReg(i.mul.rs);
 +            e.Op(Mul);
-+            e.Mem(I32Store, 2);
++            EndStore(i.rd);
 +            break;
 +        case Opcode::FusedSubsBcc:
 +            Fused(i, false, true, block_start);
@@ -1230,13 +1374,14 @@ index 000000000..93561daf1
 +            if (i.opcode == Opcode::B) {
 +                TakeBranch(i.branch.target, i.branch.target == block_start);
 +            } else if (i.opcode == Opcode::Bl) {
-+                e.Ptr(&state.regs[14]);
++                BeginStore(14);
 +                e.Const(i.branch.lr);
-+                e.Mem(I32Store, 2);
++                EndStore(14);
 +                TakeBranch(i.branch.target, false);
 +            } else {
 +                LoadReg(i.branch.rm);
 +                e.Set(LA);
++                Flush(e);
 +                e.Ptr(&state.thumb_mode);
 +                e.Get(LA);
 +                e.Const(1);
@@ -1288,6 +1433,13 @@ index 000000000..93561daf1
 +        body.Byte(0x01); // one group of locals
 +        body.Byte(NUM_LOCALS);
 +        body.Byte(0x7F);
++        for (u8 r = 0; r < 15; ++r) {
++            if (used_regs & (1u << r)) {
++                body.Ptr(&state.regs[r]);
++                body.Mem(I32Load, 2);
++                body.Set(LREG + r);
++            }
++        }
 +        if (in_loop) {
 +            body.Byte(Loop);
 +            body.Byte(BlockVoid);
@@ -1297,6 +1449,7 @@ index 000000000..93561daf1
 +            body.Byte(End);
 +        }
 +        // Ran off the end of the run: return ticks << 1
++        Flush(body);
 +        body.Get(LT);
 +        body.Const(ticks_done);
 +        body.Op(Add);
@@ -1337,11 +1490,178 @@ index 000000000..93561daf1
 +    }
 +});
 +
++namespace {
++bool FullySupported(const BasicBlock* block) {
++    if (block->inst_count == 0) {
++        return false;
++    }
++    for (u32 i = 0; i < block->inst_count; ++i) {
++        if (!JitCompiler::Supported(block->instructions[i])) {
++            return false;
++        }
++    }
++    return true;
++}
++// An unconditional branch that always leaves the block
++bool EndsBlock(const DecodedInst& inst) {
++    return JitCompiler::IsBranch(inst) && !JitCompiler::IsFused(inst) && inst.cond == 0xE;
++}
++} // namespace
++
++bool ARM_FastInterp::JitCompileRegion(BasicBlock* root) {
++    if (!FullySupported(root)) {
++        return false;
++    }
++    // Collect the root and the blocks its branches lead to, breadth first. Only blocks that are
++    // already decoded, translatable from start to end and in the same mode can join.
++    std::vector<const BasicBlock*> members{root};
++    std::vector<u32> pcs{root->start_pc};
++    std::vector<u32> ends;
++    u32 total = root->inst_count;
++    for (size_t m = 0; m < members.size(); ++m) {
++        const BasicBlock* block = members[m];
++        u32 pc = block->start_pc;
++        std::vector<u32> targets;
++        for (u32 i = 0; i < block->inst_count; ++i) {
++            const DecodedInst& inst = block->instructions[i];
++            u32 target;
++            if (JitCompiler::StaticTarget(inst, target)) {
++                targets.push_back(target);
++            } else if (inst.opcode == Opcode::Bl) {
++                targets.push_back(inst.branch.target);
++            }
++            pc += JitCompiler::SizeOf(inst);
++        }
++        ends.push_back(pc);
++        if (!EndsBlock(block->instructions[block->inst_count - 1])) {
++            targets.push_back(pc);
++        }
++        for (const u32 target : targets) {
++            if (members.size() >= MAX_REGION_BLOCKS ||
++                std::find(pcs.begin(), pcs.end(), target) != pcs.end()) {
++                continue;
++            }
++            const BasicBlock* next = cache_.Lookup(target);
++            if (next == nullptr || next->IsThumb() != root->IsThumb() || !FullySupported(next) ||
++                total + next->inst_count > MAX_REGION_INSTRUCTIONS) {
++                continue;
++            }
++            members.push_back(next);
++            pcs.push_back(target);
++            total += next->inst_count;
++        }
++    }
++
++    const auto emit = [&](JitCompiler& c) {
++        Emitter& e = c.e;
++        const u32 n = static_cast<u32>(members.size());
++        c.region_pcs = pcs;
++        // loop { block*n { br_table(next) } code 0 } code 1 } ... } : block i's code follows the
++        // end of the i-th innermost block, and every block ends by leaving or re-dispatching
++        e.Byte(0x03);
++        e.Byte(0x40);
++        for (u32 i = 0; i < n; ++i) {
++            e.Byte(0x02);
++            e.Byte(0x40);
++        }
++        e.Get(LNEXT);
++        e.Byte(0x0E);
++        e.U32(n);
++        for (u32 i = 0; i < n; ++i) {
++            e.U32(i);
++        }
++        e.U32(0);
++        for (u32 m = 0; m < n; ++m) {
++            e.Byte(0x0B);
++            c.region_block = m;
++            c.ticks_done = 0;
++            c.known = JitCompiler::Known::Nothing;
++            const BasicBlock* block = members[m];
++            for (u32 i = 0; i < block->inst_count; ++i) {
++                c.Instruction(block->instructions[i], 0xFFFFFFFF);
++            }
++            if (!EndsBlock(block->instructions[block->inst_count - 1])) {
++                // Ran off the end of the block: continue at the next address
++                e.Const(1);
++                e.Byte(0x04);
++                e.Byte(0x40);
++                c.TakeBranch(ends[m], false);
++                e.Byte(0x0B);
++            }
++        }
++        e.Byte(0x0B); // end of the dispatch loop
++        e.Byte(0x00); // unreachable: every block transfers control
++        c.ticks_done = 0;
++    };
++
++    JitCompiler probe{{}, state_, &memory_};
++    emit(probe);
++    JitCompiler compiler{{}, state_, &memory_};
++    compiler.flush_regs = probe.written_regs;
++    emit(compiler);
++    const std::vector<u8> module = compiler.Module();
++    const u32 fn = JitInstall(module.data(), static_cast<u32>(module.size()));
++    if (fn == 0) {
++        jit_enabled = false;
++        return true;
++    }
++    ++jit_functions;
++    u32 low = pcs[0], high = ends[0];
++    for (size_t m = 0; m < members.size(); ++m) {
++        low = std::min(low, pcs[m]);
++        high = std::max(high, ends[m]);
++    }
++    regions.push_back({this, root->start_pc, low, high});
++    DecodedInst& call = root->instructions[0];
++    call.opcode = Opcode::JitCall;
++    call.cond = 0xE;
++    call.jit.fn = fn;
++    call.jit.ticks = 0;
++    call.jit.count = static_cast<u8>(root->inst_count);
++    call.jit.size = 0;
++    return true;
++}
++
++// Guest code in [start, start + length) changed: retire the regions that contain a copy of it.
++// The block cache has already dropped the blocks in that range themselves.
++void ARM_FastInterp::JitInvalidate(u32 start, u64 length) {
++    const u64 end = static_cast<u64>(start) + length;
++    for (size_t i = 0; i < regions.size();) {
++        const RegionRecord& r = regions[i];
++        if (r.owner == this && r.low < end && r.high > start) {
++            cache_.InvalidateRange(r.root_pc, 1);
++            regions[i] = regions.back();
++            regions.pop_back();
++        } else {
++            ++i;
++        }
++    }
++}
++
++void ARM_FastInterp::JitClear() {
++    regions.erase(std::remove_if(regions.begin(), regions.end(),
++                                 [this](const RegionRecord& r) { return r.owner == this; }),
++                  regions.end());
++}
++
 +void ARM_FastInterp::JitCompileBlock(BasicBlock* block) {
 +    if (!jit_enabled || jit_functions >= MAX_JIT_FUNCTIONS) {
 +        return;
 +    }
 +    const u32 count = block->inst_count;
++    // Statistics for web_jit_report: which opcodes keep hot code out of the compiler
++    ++hot_blocks;
++    for (u32 i = 0; i < count; ++i) {
++        const DecodedInst& inst = block->instructions[i];
++        ++hot_instructions;
++        if (!JitCompiler::Supported(inst)) {
++            ++unsupported_instructions;
++            ++unsupported[static_cast<size_t>(inst.opcode) % unsupported.size()];
++        }
++    }
++    if (JitCompileRegion(block)) {
++        return;
++    }
 +    u32 start = 0;
 +    while (start < count) {
 +        // A run is a maximal sequence of translatable instructions, cut after an unconditional
@@ -1362,7 +1682,17 @@ index 000000000..93561daf1
 +            start = end + (end == start ? 1 : 0);
 +            continue;
 +        }
++        // First pass: find out which registers the run writes (exits must store them back)
++        u32 flush_regs = 0;
++        {
++            JitCompiler probe{{}, state_, &memory_};
++            for (u32 i = start; i < end; ++i) {
++                probe.Instruction(block->instructions[i], 0xFFFFFFFF);
++            }
++            flush_regs = probe.written_regs;
++        }
 +        JitCompiler compiler{{}, state_, &memory_};
++        compiler.flush_regs = flush_regs;
 +        if (start == 0) {
 +            for (u32 i = start; i < end; ++i) {
 +                u32 target;
@@ -1406,6 +1736,39 @@ index 000000000..93561daf1
 +}
 +EMSCRIPTEN_KEEPALIVE unsigned web_jit_function_count() {
 +    return Core::FastInterp::jit_functions;
++}
++
++// Ticks executed by compiled code and in total (counted by the interpreter loop)
++unsigned long long web_jit_ticks = 0;
++unsigned long long web_total_ticks = 0;
++
++// Share of the emulated CPU time spent in compiled code since the last call, in percent
++EMSCRIPTEN_KEEPALIVE double web_jit_coverage() {
++    static unsigned long long last_jit = 0, last_total = 0;
++    const unsigned long long jit = web_jit_ticks, total = web_total_ticks;
++    const double percent = total > last_total ? 100.0 * (jit - last_jit) / (total - last_total) : 0.0;
++    last_jit = jit;
++    last_total = total;
++    return percent;
++}
++
++// Logs how much of the hot code could be compiled and the opcodes (numbers from the Opcode
++// enum) that most often could not
++EMSCRIPTEN_KEEPALIVE void web_jit_report() {
++    using namespace Core::FastInterp;
++    std::array<std::pair<u32, u32>, 512> sorted;
++    for (u32 i = 0; i < sorted.size(); ++i) {
++        sorted[i] = {unsupported[i], i};
++    }
++    std::sort(sorted.begin(), sorted.end(), std::greater<>());
++    char line[512];
++    int n = std::snprintf(line, sizeof(line),
++                          "JIT: hot blocks %u, functions %u, untranslated %u/%u instructions. Top:",
++                          hot_blocks, jit_functions, unsupported_instructions, hot_instructions);
++    for (u32 i = 0; i < 24 && sorted[i].first != 0 && n < static_cast<int>(sizeof(line)) - 16; ++i) {
++        n += std::snprintf(line + n, sizeof(line) - n, " %u:%u", sorted[i].second, sorted[i].first);
++    }
++    std::fprintf(stderr, "%s\n", line);
 +}
 +}
 +
