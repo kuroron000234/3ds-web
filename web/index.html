@@ -35,6 +35,12 @@
       <option value="3">3 倍</option>
       <option value="4">4 倍</option>
     </select></label>
+    <label title="ゲーム内の CPU を遅くして処理を軽くします。重いゲームでは音切れが減りますが、ゲーム内の動きは遅くなることがあります">CPU 速度 <select id="clock">
+      <option value="100">100%（標準）</option>
+      <option value="75">75%（軽い）</option>
+      <option value="50">50%（もっと軽い）</option>
+      <option value="25">25%</option>
+    </select></label>
     <span id="gpu"></span>
   </div>
   <canvas id="canvas" width="400" height="480"></canvas>
@@ -238,6 +244,7 @@
   const gpu = detectGpu();
   const apiEl = document.getElementById('api');
   const scaleEl = document.getElementById('scale');
+  const clockEl = document.getElementById('clock');
   const gpuEl = document.getElementById('gpu');
   const store = {
     get(k) { try { return localStorage.getItem('3ds-web.' + k); } catch { return null; } },
@@ -247,6 +254,8 @@
   scaleEl.value = store.get('scale') || '1';
   if (!apiEl.value) apiEl.value = 'auto';
   if (!scaleEl.value) scaleEl.value = '1';
+  clockEl.value = store.get('clock') || '100';
+  if (!clockEl.value) clockEl.value = '100';
   if (!gpu.webgl2) apiEl.querySelector('option[value=OpenGL]').disabled = true;
   // 自動: WebGL2 があれば常にそれを使う。CPU 代行の WebGL でもソフトウェア描画より速い
   // （SwiftShader での実測: WebGL2 は実機比 35%、ソフトウェア描画は 4%）
@@ -264,7 +273,7 @@
       (!gpu.webgl2 ? ' → CPU で描画' : '') +
       (gameStarted ? '（変更はページを再読み込みすると反映）' : '');
   }
-  for (const el of [apiEl, scaleEl]) {
+  for (const el of [apiEl, scaleEl, clockEl]) {
     el.addEventListener('change', () => { store.set(el.id, el.value); updateGfxUi(); });
   }
   updateGfxUi();
@@ -275,6 +284,7 @@
     const scale = canScale() ? scaleEl.value : '1';
     Module.ccall('web_set_option', null, ['string', 'string'], ['citra_graphics_api', api]);
     Module.ccall('web_set_option', null, ['string', 'string'], ['citra_resolution_factor', scale]);
+    Module.ccall('web_set_option', null, ['string', 'string'], ['citra_cpu_clock_percentage', clockEl.value]);
     log(`描画: ${api === 'OpenGL' ? 'GPU（WebGL2）' : 'CPU（ソフトウェア）'}、解像度 ${scale} 倍`);
     gameStarted = true;
     updateGfxUi();
@@ -554,7 +564,13 @@
       lastStats = t;
       const speed = Module.ccall('web_get_speed', 'number', [], []);
       const busy = Module.ccall('web_get_busy', 'number', [], []);
-      if (speed > 0) speedEl.textContent = `速度 ${speed.toFixed(0)}%（処理 ${busy.toFixed(0)}%）`;
+      // 内訳: 描画 = GPU コマンド処理 + 画面出力、CPU = 残り（インタプリタと OS の処理）
+      const prof = [0, 1, 2].map((i) => Module.ccall('web_get_prof', 'number', ['number'], [i]));
+      const cpu = Math.max(0, busy - prof[0] - prof[1] - prof[2]);
+      if (speed > 0) {
+        speedEl.textContent = `速度 ${speed.toFixed(0)}%（処理 ${busy.toFixed(0)}%: CPU ${cpu.toFixed(0)}` +
+          ` / 描画 ${(prof[0] + prof[1]).toFixed(0)} / 音声 ${prof[2].toFixed(0)}）`;
+      }
     }
     requestAnimationFrame(onFrame);
   }

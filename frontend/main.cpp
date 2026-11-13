@@ -473,6 +473,12 @@ double window_busy_ms = 0.0;
 std::atomic<double> speed_percent{0.0};
 std::atomic<double> busy_percent{0.0};
 
+// コアが積算している内訳（ms）: [0] GPU コマンド処理 [1] 画面出力 [2] 音声。残りが CPU コア。
+// 窓ごとに差分を取り、エミュレーションスレッドの経過時間に対する割合（%）にして公開する。
+extern "C" double web_prof_ms[4];
+double prof_last[3]{};
+std::atomic<double> prof_percent[3]{};
+
 void Schedule() {
     tick_scheduled = true;
     ScheduleTick(next_deadline - emscripten_get_now());
@@ -497,6 +503,11 @@ void RunFrame() {
         speed_percent.store(window_frames * frame_period_ms / elapsed * 100.0,
                             std::memory_order_relaxed);
         busy_percent.store(window_busy_ms / elapsed * 100.0, std::memory_order_relaxed);
+        for (int i = 0; i < 3; ++i) {
+            prof_percent[i].store((web_prof_ms[i] - prof_last[i]) / elapsed * 100.0,
+                                  std::memory_order_relaxed);
+            prof_last[i] = web_prof_ms[i];
+        }
         window_start = end;
         window_frames = 0;
         window_busy_ms = 0.0;
@@ -671,6 +682,12 @@ EMSCRIPTEN_KEEPALIVE double web_get_speed() {
 // JS から呼ぶ: 直近約 1 秒にエミュレーションスレッドが retro_run にいた時間の割合（%）。
 EMSCRIPTEN_KEEPALIVE double web_get_busy() {
     return busy_percent.load(std::memory_order_relaxed);
+}
+
+// JS から呼ぶ: 直近約 1 秒の内訳（%）。0 = GPU コマンド処理、1 = 画面出力、2 = 音声。
+// web_get_busy からこの 3 つを引いた残りが CPU コア（インタプリタと OS の HLE）。
+EMSCRIPTEN_KEEPALIVE double web_get_prof(int slot) {
+    return slot >= 0 && slot < 3 ? prof_percent[slot].load(std::memory_order_relaxed) : 0.0;
 }
 
 // JS から呼ぶ: 入力の共有領域（int32 × 8、配置は input_state の説明を参照）。

@@ -24,8 +24,28 @@ index e99de6a81..e1c6528b0 100644
  
  # Platform-specific library requirements
  # ======================================
+diff --git a/src/audio_core/hle/hle.cpp b/src/audio_core/hle/hle.cpp
+index ba8cae289..ed645575e 100644
+--- a/src/audio_core/hle/hle.cpp
++++ b/src/audio_core/hle/hle.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv3 or any later version
+ // Refer to the LICENSE.txt file included.
+ 
++#include "common/web_prof.h"
+ #include <algorithm>
+ 
+ #include <boost/serialization/array.hpp>
+@@ -483,6 +484,7 @@ bool DspHle::Impl::Tick() {
+ }
+ 
+ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
++    WEB_PROF_SCOPE(Audio);
+     if (sleep_pending) {
+         FinishPendingSleep();
+         sleep_reply_frames = 2;
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
-index e28f9941b..8824bea1d 100644
+index e28f9941b..983f1ae01 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
 @@ -99,3 +99,35 @@ else()
@@ -57,7 +77,7 @@ index e28f9941b..8824bea1d 100644
 +            -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
 +            -sPTHREAD_POOL_SIZE=11 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
-+            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_input_ptr,_web_audio_ptr,_web_tick
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_get_prof,_web_input_ptr,_web_audio_ptr,_web_tick
 +            # Name the C++ exception and the functions on its stack when a thread dies of one
 +            --pre-js ${WEB_FRONTEND_DIR}/pre.js
 +            -sEXCEPTION_STACK_TRACES -sEXPORT_EXCEPTION_HANDLING_HELPERS --profiling-funcs
@@ -151,18 +171,67 @@ index cad2108c3..da65be0a6 100644
      pthread_setname_np(name);
  #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
      pthread_set_name_np(pthread_self(), name);
+diff --git a/src/common/web_prof.h b/src/common/web_prof.h
+new file mode 100644
+index 000000000..43aa1896a
+--- /dev/null
++++ b/src/common/web_prof.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the misc/licenses/gplv2.txt file included.
++
++#pragma once
++
++// Coarse time accounting for the web build: how much of the emulation thread's time goes to
++// GPU command processing, presenting and audio. Everything else in a frame is the CPU core.
++// All scopes run on the emulation thread and never nest within the same slot.
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++
++extern "C" double web_prof_ms[4];
++
++namespace Common {
++enum class WebProfSlot { Gpu = 0, Present = 1, Audio = 2 };
++
++class WebProfScope {
++public:
++    explicit WebProfScope(WebProfSlot slot_) : slot{slot_}, start{emscripten_get_now()} {}
++    ~WebProfScope() {
++        web_prof_ms[static_cast<int>(slot)] += emscripten_get_now() - start;
++    }
++
++private:
++    WebProfSlot slot;
++    double start;
++};
++} // namespace Common
++
++#define WEB_PROF_SCOPE(slot) const Common::WebProfScope web_prof_scope{Common::WebProfSlot::slot}
++#else
++#define WEB_PROF_SCOPE(slot)
++#endif
 diff --git a/src/common/web_util.cpp b/src/common/web_util.cpp
-index a2bbc01dc..aed9a03be 100644
+index a2bbc01dc..fdfde9784 100644
 --- a/src/common/web_util.cpp
 +++ b/src/common/web_util.cpp
-@@ -2,6 +2,7 @@
+@@ -2,8 +2,15 @@
  // Licensed under GPLv2 or any later version
  // Refer to the misc/licenses/gplv2.txt file included.
  
 +#include <cstdlib>
  #include "web_util.h"
  
++#ifdef __EMSCRIPTEN__
++extern "C" {
++double web_prof_ms[4] = {};
++}
++#endif
++
  namespace Common {
+ // Splits URL into its components. Example: https://citra-emu.org:443/index.html
+ // is_https: true; host: citra-emu.org; port: 443; path: /index.html
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 814863e52..282c30c60 100644
 --- a/src/core/CMakeLists.txt
@@ -886,6 +955,42 @@ index 193ccde63..2d14ced5f 100644
  
  #include "artic_base_common.h"
  #include "network/socket_manager.h"
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index f415ceceb..41e4ad768 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv3 or any later version
+ // Refer to the LICENSE.txt file included.
+ 
++#include "common/web_prof.h"
+ #include "common/archives.h"
+ #include "common/hacks/hack_manager.h"
+ #include "common/microprofile.h"
+@@ -463,6 +464,7 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
+ }
+ 
+ void GPU::SubmitCmdList(u32 index) {
++    WEB_PROF_SCOPE(Gpu);
+     // Check if a command list was triggered.
+     auto& config = impl->pica.regs.internal.pipeline.command_buffer;
+     if (!config.trigger[index]) {
+@@ -491,6 +493,7 @@ void GPU::SubmitCmdList(u32 index) {
+ }
+ 
+ void GPU::MemoryFill(u32 index, u32 intr_index) {
++    WEB_PROF_SCOPE(Gpu);
+     // Check if a memory fill was triggered.
+     auto& config = impl->pica.regs.memory_fill_config[index];
+     if (!config.trigger) {
+@@ -524,6 +527,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
+ }
+ 
+ void GPU::MemoryTransfer() {
++    WEB_PROF_SCOPE(Gpu);
+     // Check if a transfer was triggered.
+     auto& config = impl->pica.regs.display_transfer_config;
+     if (!config.trigger.Value()) {
 diff --git a/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag b/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag
 index 54b6e831e..d86c786d9 100644
 --- a/src/video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_ms.frag
@@ -1245,7 +1350,7 @@ index 542d6a5e4..a3c45cfab 100644
      bool IsSuitable() const {
          return is_suitable;
 diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
-index 4cc7777f3..5d901595d 100644
+index 4cc7777f3..bd4543e0c 100644
 --- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
 +++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
 @@ -35,6 +35,29 @@ constexpr std::size_t INDEX_BUFFER_SIZE = 2_MiB;
@@ -1355,7 +1460,63 @@ index 4cc7777f3..5d901595d 100644
  }
  
  RasterizerOpenGL::~RasterizerOpenGL() = default;
-@@ -533,6 +586,28 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+@@ -379,6 +432,7 @@ void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
+     state.Apply();
+ 
+     std::array<bool, 16> enable_attributes{};
++    const u32 stride_alignment = driver.IsWebGL() ? 4 : 1;
+ 
+     for (const auto& loader : vertex_attributes.attribute_loaders) {
+         if (loader.component_count == 0 || loader.byte_count == 0) {
+@@ -396,7 +450,9 @@ void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
+                     u32 input_reg = regs.vs.GetRegisterForAttribute(attribute_index);
+                     GLint size = vertex_attributes.GetNumElements(attribute_index);
+                     GLenum type = MakeAttributeType(vertex_attributes.GetFormat(attribute_index));
+-                    GLsizei stride = loader.byte_count;
++                    // WebGL rejects strides and offsets that are not multiples of the type size
++                    GLsizei stride = Common::AlignUp(static_cast<u32>(loader.byte_count),
++                                                     stride_alignment);
+                     glVertexAttribPointer(input_reg, size, type, GL_FALSE, stride,
+                                           reinterpret_cast<GLvoid*>(buffer_offset + offset));
+                     enable_attributes[input_reg] = true;
+@@ -418,10 +474,24 @@ void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
+         const u32 data_size = loader.byte_count * vertex_num;
+ 
+         res_cache.FlushRegion(data_addr, data_size);
+-        std::memcpy(array_ptr, memory.GetPhysicalPointer(data_addr), data_size);
++        const u8* src_ptr = memory.GetPhysicalPointer(data_addr);
++        const u32 aligned_stride =
++            Common::AlignUp(static_cast<u32>(loader.byte_count), stride_alignment);
++        if (aligned_stride == loader.byte_count) {
++            std::memcpy(array_ptr, src_ptr, data_size);
++        } else {
++            for (u32 vertex = 0; vertex < vertex_num; vertex++) {
++                std::memcpy(array_ptr + vertex * aligned_stride,
++                            src_ptr + vertex * loader.byte_count, loader.byte_count);
++            }
++        }
+ 
+-        array_ptr += data_size;
+-        buffer_offset += data_size;
++        // AnalyzeVertexArray reserved the same padded size for each loader
++        const u32 padded_size = stride_alignment == 1
++                                    ? data_size
++                                    : Common::AlignUp(aligned_stride * vertex_num, 4);
++        array_ptr += padded_size;
++        buffer_offset += padded_size;
+     }
+ 
+     for (std::size_t i = 0; i < enable_attributes.size(); ++i) {
+@@ -493,7 +563,7 @@ bool RasterizerOpenGL::AccelerateDrawBatch(bool is_indexed) {
+ 
+ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+     const GLenum primitive_mode = MakePrimitiveMode(regs.pipeline.triangle_topology);
+-    const auto vertex_array_info = AnalyzeVertexArray(is_indexed);
++    const auto vertex_array_info = AnalyzeVertexArray(is_indexed, driver.IsWebGL() ? 4 : 1);
+ 
+     if (vertex_array_info.Invalid()) {
+         // Do not draw anything if the vertex array is invalid.
+@@ -533,6 +603,28 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
              memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
                                        regs.pipeline.index_array.offset);
          std::tie(buffer_ptr, buffer_offset, std::ignore) = index_buffer.Map(index_buffer_size, 4);
@@ -1384,7 +1545,7 @@ index 4cc7777f3..5d901595d 100644
          std::memcpy(buffer_ptr, index_data, index_buffer_size);
          index_buffer.Unmap(index_buffer_size);
  
-@@ -579,6 +654,12 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+@@ -579,6 +671,12 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
          (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
           (has_stencil && state.stencil.test_enabled));
  
@@ -1397,7 +1558,7 @@ index 4cc7777f3..5d901595d 100644
      const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
      const Framebuffer* framebuffer = fb_helper.Framebuffer();
      if (!framebuffer->color_id && framebuffer->shadow_rendering) {
-@@ -684,7 +765,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+@@ -684,7 +782,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
  
      vertex_batch.clear();
  
@@ -1406,7 +1567,7 @@ index 4cc7777f3..5d901595d 100644
          glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                          GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
      }
-@@ -921,6 +1002,87 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
+@@ -921,6 +1019,87 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
      return true;
  }
  
@@ -1494,7 +1655,7 @@ index 4cc7777f3..5d901595d 100644
  void RasterizerOpenGL::SyncAndUploadLUTsLF() {
      constexpr std::size_t max_size =
          sizeof(Common::Vec2f) * 256 * Pica::LightingRegs::NumLightingSampler +
-@@ -1043,6 +1205,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
+@@ -1043,6 +1222,7 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
  
      texture_buffer.Unmap(bytes_used);
  }
@@ -2416,10 +2577,26 @@ index 3b5d86ea6..0c504669d 100644
      // Check for dummy values indicating an unknown mode
      if (gl_mode == 0) {
 diff --git a/src/video_core/renderer_opengl/renderer_opengl.cpp b/src/video_core/renderer_opengl/renderer_opengl.cpp
-index 8244a83fa..181c7392c 100644
+index 8244a83fa..dd2703639 100644
 --- a/src/video_core/renderer_opengl/renderer_opengl.cpp
 +++ b/src/video_core/renderer_opengl/renderer_opengl.cpp
-@@ -462,8 +462,15 @@ void RendererOpenGL::ReloadShader(Settings::StereoRenderOption render_3d) {
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv3 or any later version
+ // Refer to the LICENSE.txt file included.
+ 
++#include "common/web_prof.h"
+ #include "common/logging/log.h"
+ #include "common/microprofile.h"
+ #include "common/settings.h"
+@@ -93,6 +94,7 @@ RendererOpenGL::~RendererOpenGL() {
+ }
+ 
+ void RendererOpenGL::SwapBuffers() {
++    WEB_PROF_SCOPE(Present);
+     system.perf_stats->StartSwap();
+     // Maintain the rasterizer's state as a priority
+     OpenGLState prev_state = OpenGLState::GetCurState();
+@@ -462,8 +464,15 @@ void RendererOpenGL::ReloadShader(Settings::StereoRenderOption render_3d) {
      uniform_i_resolution = glGetUniformLocation(shader.handle, "i_resolution");
      uniform_o_resolution = glGetUniformLocation(shader.handle, "o_resolution");
      uniform_layer = glGetUniformLocation(shader.handle, "layer");
