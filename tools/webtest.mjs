@@ -9,6 +9,7 @@
 //   --graphics <api>        OpenGL | Software（既定 OpenGL）
 //   --option key=value      コア設定の上書き（何度でも）
 //   --seconds <n>           ROM 読み込み後に動かす秒数（既定 10）
+//   --frames <n>            秒数の代わりに、エミュレーションが n フレーム進むまで動かす（画面を同じ時点で比べる用）
 //   --log-lines <n>         ログの末尾を何行返すか（既定 40）
 //   --chromebook            Chromebook 相当の計測（CPU・メモリの制限は laptop-agent.sh が掛ける）
 //
@@ -34,6 +35,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--graphics') opts.graphics = argv[++i];
   else if (a === '--option') opts.options.push(argv[++i]);
   else if (a === '--seconds') opts.seconds = Number(argv[++i]);
+  else if (a === '--frames') opts.frames = Number(argv[++i]);
   else if (a === '--log-lines') opts.logLines = Number(argv[++i]);
   else if (a === '--chromebook') opts.chromebook = true;
   else throw new Error('不明なオプション: ' + a);
@@ -91,7 +93,7 @@ try {
   await page.waitForFunction(() => window.__ready, null, { timeout: 60000 });
   result.readyMs = Date.now() - t0;
 
-  const run = await page.evaluate(async ({ rom, graphics, options, seconds }) => {
+  const run = await page.evaluate(async ({ rom, graphics, options, seconds, frames: untilFrames }) => {
     const out = {};
     const gl = document.createElement('canvas').getContext('webgl2');
     const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
@@ -129,7 +131,11 @@ try {
     const po = new PerformanceObserver(l => { for (const e of l.getEntries()) longMs += e.duration; });
     try { po.observe({ entryTypes: ['longtask'] }); } catch {}
     const s0 = performance.now();
-    await new Promise(r => setTimeout(r, seconds * 1000));
+    if (untilFrames) {
+      while (Module.ccall('web_get_frame_count', 'number', [], []) - f0 < untilFrames) await new Promise(r => setTimeout(r, 10));
+    } else {
+      await new Promise(r => setTimeout(r, seconds * 1000));
+    }
     rafOn = false;
     po.disconnect();
     const sec = (performance.now() - s0) / 1000;
@@ -170,7 +176,7 @@ try {
     out.glslErrors = count(lines.filter(l => /^(ERROR|WARNING): \d+:/.test(l)), l => l.replace(/\d+:\d+/, 'N:N').slice(0, 200));
     out.logTail = lines.filter(l => !l.includes('FetchVariable')).slice(-40);
     return out;
-  }, { rom: opts.rom, graphics: opts.graphics, options: opts.options, seconds: opts.seconds });
+  }, { rom: opts.rom, graphics: opts.graphics, options: opts.options, seconds: opts.seconds, frames: opts.frames });
   Object.assign(result, run);
   result.logTail = run.logTail.slice(-opts.logLines);
 

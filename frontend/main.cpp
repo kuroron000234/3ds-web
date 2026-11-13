@@ -622,7 +622,10 @@ void SetOptionOnEmuThread(void* arg) {
     auto* req = static_cast<OptionRequest*>(arg);
     // コアの設定ではなく、Web 版の JIT（熱いブロックを WASM に変換）の入/切
     if (std::string(req->key) == "web_jit") {
-        web_jit_set_enabled(std::string(req->value) != "disabled");
+        // "disabled" で切。数値なら切り分け用のビット（fastinterp_jit_web.cpp の Off* を参照）
+        const std::string value = req->value;
+        const bool numeric = !value.empty() && value[0] >= '0' && value[0] <= '9';
+        web_jit_set_enabled(value == "disabled" ? 0 : numeric ? (std::atoi(value.c_str()) | 1) : 1);
         return;
     }
     options[req->key] = req->value;

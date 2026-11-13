@@ -255,10 +255,10 @@ index 814863e52..0cde3e591 100644
  
  if (CITRA_USE_PRECOMPILED_HEADERS)
 diff --git a/src/core/arm/fastinterp/fastinterp.cpp b/src/core/arm/fastinterp/fastinterp.cpp
-index cd24691b6..4a14dd0c9 100644
+index cd24691b6..af056f708 100644
 --- a/src/core/arm/fastinterp/fastinterp.cpp
 +++ b/src/core/arm/fastinterp/fastinterp.cpp
-@@ -21,6 +21,12 @@ namespace Core::FastInterp {
+@@ -21,6 +21,13 @@ namespace Core::FastInterp {
  // this zero-initialized array (8MB of BSS nullptrs, zero-fill-on-demand, touched
  // only if the guest runs without a page table), so the MEM_* fast paths and the
  // unmapped-PC check never need a null test on the array itself.
@@ -266,12 +266,13 @@ index cd24691b6..4a14dd0c9 100644
 +// Coverage counters of the WebAssembly block compiler (fastinterp_jit_web.cpp)
 +extern "C" unsigned long long web_jit_ticks;
 +extern "C" unsigned long long web_total_ticks;
++extern "C" unsigned long long web_jit_calls;
 +#endif
 +
  static u8* empty_page_table[1 << (32 - FASTINTERP_PAGE_BITS)];
  
  // Included inside the namespace: the macros reference LazyFlags and CondPassed.
-@@ -118,6 +124,9 @@ void ARM_FastInterp::Run() {
+@@ -118,6 +125,9 @@ void ARM_FastInterp::Run() {
          // flush inside their handler and return executed==0, so they are not double-counted.
          if (executed > 0) {
              timer->AddTicks(executed);
@@ -281,7 +282,7 @@ index cd24691b6..4a14dd0c9 100644
          }
      }
  }
-@@ -527,6 +536,7 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+@@ -527,6 +537,7 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
          // PC-source elimination
          HANDLER(LdrLit),
          HANDLER(PcSetup),
@@ -289,7 +290,7 @@ index cd24691b6..4a14dd0c9 100644
      };
  #undef HANDLER
  
-@@ -786,6 +796,25 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+@@ -786,6 +797,26 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
  #include "handlers/fused.inc"
      // clang-format on
  
@@ -300,6 +301,7 @@ index cd24691b6..4a14dd0c9 100644
 +    const u32 jit_result = reinterpret_cast<u32 (*)()>(inst->jit.fn)();
 +    executed += jit_result >> 1;
 +    web_jit_ticks += jit_result >> 1;
++    ++web_jit_calls;
 +    if (jit_result & 1) {
 +        SET_PC(state_.regs[15]);
 +        goto chain;
@@ -315,7 +317,7 @@ index cd24691b6..4a14dd0c9 100644
  chain:
      SYNC_PC();
  
-@@ -847,6 +876,9 @@ done:
+@@ -847,6 +878,9 @@ done:
          fusion_stats_.hot_blocks_detected++;
          if (!disable_reoptimization_) {
              ReoptimizeHotBlock(block);
@@ -325,7 +327,7 @@ index cd24691b6..4a14dd0c9 100644
          }
      }
  
-@@ -1007,11 +1039,17 @@ u32 ARM_FastInterp::ReadMemory32(u32 addr) {
+@@ -1007,11 +1041,17 @@ u32 ARM_FastInterp::ReadMemory32(u32 addr) {
  // ============================================================================
  
  void ARM_FastInterp::ClearInstructionCache() {
@@ -344,10 +346,10 @@ index cd24691b6..4a14dd0c9 100644
  
  void ARM_FastInterp::ClearExclusiveState() {
 diff --git a/src/core/arm/fastinterp/fastinterp.h b/src/core/arm/fastinterp/fastinterp.h
-index bb1d46451..4ee8a106b 100644
+index bb1d46451..d725780f9 100644
 --- a/src/core/arm/fastinterp/fastinterp.h
 +++ b/src/core/arm/fastinterp/fastinterp.h
-@@ -111,6 +111,13 @@ private:
+@@ -111,6 +111,16 @@ private:
  
      /// Reoptimize a hot block (apply additional optimizations after detection)
      void ReoptimizeHotBlock(BasicBlock* block);
@@ -357,16 +359,19 @@ index bb1d46451..4ee8a106b 100644
 +    bool JitCompileRegion(BasicBlock* root);
 +    void JitInvalidate(u32 start, u64 length);
 +    void JitClear();
++    static u32 JitFallback(ARM_FastInterp* self, const DecodedInst* inst);
++    static u32 JitHelper(ARM_FastInterp* self, const DecodedInst* inst);
++    friend struct JitCompiler;
 +#endif
  
      Memory::MemorySystem& memory_;
      InterpreterState state_;
 diff --git a/src/core/arm/fastinterp/fastinterp_jit_web.cpp b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
 new file mode 100644
-index 000000000..9854e32de
+index 000000000..4d9876a29
 --- /dev/null
 +++ b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
-@@ -0,0 +1,1406 @@
+@@ -0,0 +1,2707 @@
 +// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
 +// Licensed under GPLv2 or any later version
 +// Refer to the misc/licenses/gplv2.txt file included.
@@ -389,7 +394,11 @@ index 000000000..9854e32de
 +
 +#include <algorithm>
 +#include <array>
++#include <bit>
++#include <cmath>
++#include <cstring>
 +#include <cstdio>
++#include <deque>
 +#include <vector>
 +#include <emscripten.h>
 +#include "common/logging/log.h"
@@ -401,6 +410,27 @@ index 000000000..9854e32de
 +namespace {
 +
 +bool jit_enabled = true;
++// For narrowing down a mistranslation: the option web_jit=<number> turns parts of the compiler
++// off (bit 0 is ignored; see Off below for the others)
++u32 jit_off = 0;
++enum : u32 {
++    OffRegions = 2,
++    OffFallback = 4,
++    OffHelper = 8,
++    OffCarryShift = 16, // ADC/SBC/RSC, MLA, CLZ, shifts by a register
++    OffVfpMisc = 32,    // VMRS/VMSR, VMOV immediate/double, VLDR/VSTR double, VLDM/VSTM
++    OffPcWrite = 64,    // BLX, writes to the PC
++    OffFusedLogical = 128,
++    OffReturns = 256,
++    OffRejoin = 512,
++    OffVfpSingle = 1024,
++    OffBlockTransfer = 2048,
++};
++bool Off(u32 bit) {
++    return (jit_off & bit) != 0;
++}
++// Debugging aid: bit 1 keeps VFP in the interpreter, bit 2 block transfers (web_jit=<number>)
++u32 jit_exclude = 0;
 +u32 jit_functions = 0;
 +u32 hot_blocks = 0;
 +u32 hot_instructions = 0;
@@ -413,8 +443,10 @@ index 000000000..9854e32de
 +constexpr u32 MAX_LOOP_ITERATIONS = 16;
 +// A region is a group of blocks compiled into one function so that branches between them stay
 +// inside the compiled code instead of returning to the interpreter
-+constexpr u32 MAX_REGION_BLOCKS = 12;
-+constexpr u32 MAX_REGION_INSTRUCTIONS = 160;
++constexpr u32 MAX_REGION_BLOCKS = 16;
++constexpr u32 MAX_REGION_INSTRUCTIONS = 240;
++// Return addresses of calls made inside a region that a `bx lr` / `pop {pc}` is checked against
++constexpr u32 MAX_REGION_RETURNS = 4;
 +// Block-to-block transfers inside a region per call (bounds how late a timer slice can end)
 +constexpr u32 MAX_REGION_TRANSFERS = 32;
 +
@@ -424,8 +456,15 @@ index 000000000..9854e32de
 +    u32 root_pc;
 +    u32 low;
 +    u32 high;
++    bool thumb;
++    DecodedInst original; // The root's first instruction, which the JitCall replaced
 +};
 +std::vector<RegionRecord> regions;
++
++// Copies of the instructions that compiled code hands back to the interpreter one at a time
++// (JitFallback). The block cache may recycle a block while a region that contains a copy of it
++// is still installed, so the generated code cannot point into the cache.
++std::deque<DecodedInst> fallback_pool;
 +
 +// Helpers the generated code reaches through the function table (call_indirect).
 +u32 JitCond(LazyFlags* flags, u32 cond) {
@@ -435,6 +474,8 @@ index 000000000..9854e32de
 +u32 JitGetPacked(LazyFlags* flags) {
 +    return flags->GetPacked();
 +}
++u64 slow_reads = 0;
++u64 slow_writes = 0;
 +u32 JitRead8(Memory::MemorySystem* memory, u32 addr) {
 +    return memory->Read8(addr);
 +}
@@ -442,6 +483,7 @@ index 000000000..9854e32de
 +    return memory->Read16(addr);
 +}
 +u32 JitRead32(Memory::MemorySystem* memory, u32 addr) {
++    ++slow_reads;
 +    return memory->Read32(addr);
 +}
 +void JitWrite8(Memory::MemorySystem* memory, u32 addr, u32 value) {
@@ -451,6 +493,7 @@ index 000000000..9854e32de
 +    memory->Write16(addr, static_cast<u16>(value));
 +}
 +void JitWrite32(Memory::MemorySystem* memory, u32 addr, u32 value) {
++    ++slow_writes;
 +    memory->Write32(addr, value);
 +}
 +
@@ -506,6 +549,11 @@ index 000000000..9854e32de
 +        Byte(align);
 +        Byte(0);
 +    }
++    void MemAt(u8 op, u8 align, u32 offset) {
++        Byte(op);
++        Byte(align);
++        U32(offset);
++    }
 +    void Get(u8 local) {
 +        Byte(0x20);
 +        Byte(local);
@@ -548,6 +596,12 @@ index 000000000..9854e32de
 +    Known known = Known::Nothing;
 +    std::vector<u32> region_pcs; // Region mode: start addresses of the member blocks
 +    u32 region_block = 0;        // Region mode: index of the block being emitted
++    std::vector<u32> region_returns; // Region mode: member blocks that follow a call
++    bool region_thumb = false;
++    ARM_FastInterp* self = nullptr;
++    bool probe = false;       // First pass: only collects the register sets
++    u32 pc = 0;               // Guest address of the instruction after the one being emitted
++    u32 nest = 0;             // Open `if`s around the code being emitted (for TakeBranch)
 +    bool in_loop = false;     // The run is wrapped in a loop (it branches to its own start)
 +    u32 loop_target = 0;      // Guest address of the loop head
 +    u32 ticks_done = 0;       // Ticks of the instructions emitted so far, including the current
@@ -599,7 +653,7 @@ index 000000000..9854e32de
 +    }
 +
 +    // Emitted where a branch is taken: write the target and leave, or go round the loop again.
-+    // Must be called inside exactly one `if`.
++    // `nest` must hold the number of `if`s open around the call.
 +    void TakeBranch(u32 target, bool to_start) {
 +        if (!region_pcs.empty()) {
 +            const auto it = std::find(region_pcs.begin(), region_pcs.end(), target);
@@ -620,8 +674,8 @@ index 000000000..9854e32de
 +                e.Op(BlockVoid);
 +                e.Const(static_cast<u32>(it - region_pcs.begin()));
 +                e.Set(LNEXT);
-+                e.Byte(0x0C); // br to the dispatch loop: two `if`s, then the enclosing blocks
-+                e.U32(2 + static_cast<u32>(region_pcs.size()) - 1 - region_block);
++                e.Byte(0x0C); // br to the dispatch loop: the `if`s, then the enclosing blocks
++                e.U32(nest + 1 + static_cast<u32>(region_pcs.size()) - 1 - region_block);
 +                e.Op(End);
 +                Flush(e);
 +                e.Ptr(&state.regs[15]);
@@ -645,7 +699,7 @@ index 000000000..9854e32de
 +            e.Const(MAX_LOOP_ITERATIONS);
 +            e.Op(LtU);
 +            e.Op(BrIf);
-+            e.Byte(1); // the enclosing `if` is depth 0, the loop depth 1
++            e.U32(nest); // past the enclosing `if`s to the loop
 +            Flush(e);
 +            e.Ptr(&state.regs[15]);
 +            e.Const(target);
@@ -669,6 +723,88 @@ index 000000000..9854e32de
 +        e.Const(1);
 +        e.Op(Or);
 +        e.Op(Return);
++    }
++
++    // Leaves for the address in `local` (bit 0 selects Thumb), as BX does. In a region, a return
++    // to the instruction after one of the region's own calls stays inside.
++    void ExitIndirect(u8 local) {
++        for (const u32 index : region_returns) {
++            e.Get(local);
++            e.Const(region_pcs[index] | (region_thumb ? 1 : 0));
++            e.Op(Eq);
++            e.Op(If);
++            e.Op(BlockVoid);
++            e.Get(LT);
++            e.Const(ticks_done);
++            e.Op(Add);
++            e.Set(LT);
++            e.Get(LN);
++            e.Const(1);
++            e.Op(Add);
++            e.Tee(LN);
++            e.Const(MAX_REGION_TRANSFERS);
++            e.Op(LtU);
++            e.Op(If);
++            e.Op(BlockVoid);
++            e.Const(index);
++            e.Set(LNEXT);
++            e.Byte(0x0C);
++            e.U32(nest + 2 + static_cast<u32>(region_pcs.size()) - 1 - region_block);
++            e.Op(End);
++            Flush(e);
++            e.Ptr(&state.regs[15]);
++            e.Const(region_pcs[index]);
++            e.Mem(I32Store, 2);
++            e.Get(LT);
++            Exit();
++            e.Op(End);
++        }
++        Flush(e);
++        e.Ptr(&state.thumb_mode);
++        e.Get(local);
++        e.Const(1);
++        e.Op(And);
++        e.Mem(I32Store8, 0);
++        e.Ptr(&state.regs[15]);
++        e.Get(local);
++        e.Const(0xFFFFFFFE);
++        e.Op(And);
++        e.Mem(I32Store, 2);
++        e.Get(LT);
++        e.Const(ticks_done);
++        e.Op(Add);
++        Exit();
++    }
++    // An instruction (ALU, LDR) wrote its result to regs[15]: branch there
++    void ExitToWrittenPc() {
++        e.Ptr(&state.regs[15]);
++        e.Mem(I32Load, 2);
++        e.Set(LA);
++        ExitIndirect(LA);
++    }
++
++    // Has the interpreter execute one instruction this file does not translate, so that it
++    // does not split the region. The handler checks the condition itself.
++    u32 reload_regs = 0; // used_regs of the first pass
++    void Fallback(const DecodedInst& i) {
++        const DecodedInst* stable = &i;
++        if (!probe) {
++            fallback_pool.push_back(i);
++            stable = &fallback_pool.back();
++        }
++        Flush(e);
++        e.Ptr(self);
++        e.Ptr(stable);
++        e.Call(&ARM_FastInterp::JitFallback, TypeII_I);
++        e.Op(0x1A); // drop
++        for (u8 r = 0; r < 15; ++r) {
++            if (reload_regs & (1u << r)) {
++                e.Ptr(&state.regs[r]);
++                e.Mem(I32Load, 2);
++                e.Set(LREG + r);
++            }
++        }
++        known = Known::Nothing;
 +    }
 +
 +    // Registers r0-r14 are loaded into locals when the run starts and the ones it may write are
@@ -745,11 +881,17 @@ index 000000000..9854e32de
 +        }
 +    }
 +
-+    static bool Op2Supported(const DecodedInst& i) {
++    // Operand 2 where the shifter's carry-out is needed (logical ops that set the flags)
++    static bool Op2CarrySupported(const DecodedInst& i) {
 +        if (i.dp.rm == 0xFF) {
 +            return true;
 +        }
 +        return i.dp.rs == 0xFF && ShiftSupported(i.dp.shift_type, i.dp.shift_imm);
++    }
++    // Operand 2 without the carry-out: a shift by a register is fine too
++    static bool Op2Supported(const DecodedInst& i) {
++        return i.dp.rm == 0xFF || i.dp.rs != 0xFF ||
++               ShiftSupported(i.dp.shift_type, i.dp.shift_imm);
 +    }
 +
 +    // Pushes operand 2 (GetOp2Fast). With want_carry, also updates local LC, which must already
@@ -765,6 +907,45 @@ index 000000000..9854e32de
 +        }
 +        const ShiftType type = i.dp.shift_type;
 +        const u8 amount = i.dp.shift_imm;
++        if (i.dp.rs != 0xFF) {
++            // Shift by the low byte of a register (GetOp2Fast + ShiftNoCarry): 0 leaves the
++            // value alone, 32 or more shifts everything out
++            LoadReg(i.dp.rm);
++            e.Set(LP);
++            LoadReg(i.dp.rs);
++            e.Const(0xFF);
++            e.Op(And);
++            e.Set(LC);
++            switch (type) {
++            case ShiftType::LSL:
++            case ShiftType::LSR:
++                e.Get(LP);
++                e.Get(LC);
++                e.Op(type == ShiftType::LSL ? Shl : ShrU);
++                e.Const(0);
++                e.Get(LC);
++                e.Const(32);
++                e.Op(LtU);
++                e.Op(0x1B); // select
++                break;
++            case ShiftType::ASR:
++                e.Get(LP);
++                e.Get(LC);
++                e.Const(31);
++                e.Get(LC);
++                e.Const(31);
++                e.Op(LtU);
++                e.Op(0x1B);
++                e.Op(ShrS);
++                break;
++            case ShiftType::ROR:
++                e.Get(LP);
++                e.Get(LC);
++                e.Op(Rotr);
++                break;
++            }
++            return;
++        }
 +        LoadReg(i.dp.rm);
 +        if (want_carry && !(type == ShiftType::LSL && amount == 0)) {
 +            // Carry-out is one bit of the unshifted value
@@ -851,6 +1032,147 @@ index 000000000..9854e32de
 +        EndStore(rd);
 +    }
 +
++    // 32-bit read of the guest address in LA, left on the stack
++    void ReadWord() {
++        PagePointer();
++        e.Op(If);
++        e.Op(BlockI32);
++        HostAddress();
++        e.Mem(I32Load, 0);
++        e.Op(Else);
++        Flush(e);
++        e.Ptr(memory);
++        e.Get(LA);
++        e.Call(&JitRead32, TypeII_I);
++        e.Op(End);
++    }
++    // 32-bit write of local `value` to the guest address in LA
++    void WriteWord(u8 value) {
++        PagePointer();
++        e.Op(If);
++        e.Op(BlockVoid);
++        HostAddress();
++        e.Get(value);
++        e.Mem(I32Store, 0);
++        e.Op(Else);
++        Flush(e);
++        e.Ptr(memory);
++        e.Get(LA);
++        e.Get(value);
++        e.Call(&JitWrite32, TypeIII);
++        e.Op(End);
++    }
++
++    // VFP single-precision registers stay in the interpreter state (vfp_regs holds the bits)
++    void LoadS(u8 index) {
++        e.Ptr(&state.vfp_regs[index]);
++        e.Mem(0x2A, 2); // f32.load
++    }
++    // kind: 0 add, 1 sub, 2 mul, 3 div, 4 mla, 5 mls, 6 neg
++    void VfpS(const DecodedInst& i, int kind) {
++        e.Ptr(&state.vfp_regs[i.vfp.sd]);
++        if (kind == 6) {
++            LoadS(i.vfp.sm);
++            e.Op(0x8C); // f32.neg
++        } else {
++            if (kind == 4 || kind == 5) {
++                LoadS(i.vfp.sd);
++            }
++            LoadS(i.vfp.sn);
++            LoadS(i.vfp.sm);
++            static constexpr u8 ops[] = {0x92, 0x93, 0x94, 0x95, 0x94, 0x94};
++            e.Op(ops[kind]);
++            if (kind == 4) {
++                e.Op(0x92); // f32.add
++            } else if (kind == 5) {
++                e.Op(0x93); // f32.sub
++            }
++        }
++        e.Mem(0x38, 2); // f32.store
++    }
++
++    // LDM/STM. Mirrors the handlers: one page lookup when every word is on the same mapped
++    // page, otherwise a call per word.
++    void BlockTransfer(const DecodedInst& i, bool load) {
++        const u32 count = i.lsm.count;
++        LoadReg(i.lsm.rn);
++        e.Tee(LC); // base before any register is loaded
++        e.Const(static_cast<u32>(static_cast<s32>(i.lsm.base_off)));
++        e.Op(Add);
++        e.Set(LA);
++        PagePointer();
++        e.Const(0);
++        e.Op(Ne);
++        e.Get(LA);
++        e.Get(LA);
++        e.Const(count * 4 - 4);
++        e.Op(Add);
++        e.Op(Xor);
++        e.Const(FASTINTERP_PAGE_BITS);
++        e.Op(ShrU);
++        e.Op(Eqz);
++        e.Op(And);
++        e.Op(If);
++        e.Op(BlockVoid);
++        HostAddress();
++        e.Set(LO);
++        u32 k = 0;
++        for (u8 r = 0; r < 16; ++r) {
++            if (!(i.lsm.reg_list & (1u << r))) {
++                continue;
++            }
++            if (load) {
++                e.Get(LO);
++                e.MemAt(I32Load, 0, k * 4);
++                if (r == 15) {
++                    e.Set(LR);
++                } else {
++                    EndStore(r);
++                }
++            } else {
++                e.Get(LO);
++                LoadReg(r);
++                e.MemAt(I32Store, 0, k * 4);
++            }
++            ++k;
++        }
++        e.Op(Else);
++        Flush(e);
++        k = 0;
++        for (u8 r = 0; r < 16; ++r) {
++            if (!(i.lsm.reg_list & (1u << r))) {
++                continue;
++            }
++            e.Ptr(memory);
++            e.Get(LA);
++            e.Const(k * 4);
++            e.Op(Add);
++            if (load) {
++                e.Call(&JitRead32, TypeII_I);
++                if (r == 15) {
++                    e.Set(LR);
++                } else {
++                    EndStore(r);
++                }
++            } else {
++                LoadReg(r);
++                e.Call(&JitWrite32, TypeIII);
++            }
++            ++k;
++        }
++        e.Op(End);
++        if (i.lsm.flags & 0x01) {
++            e.Get(LC);
++            e.Const(static_cast<u32>(static_cast<s32>(i.lsm.wb_delta)));
++            e.Op(Add);
++            EndStore(i.lsm.rn);
++        }
++        if (load && (i.lsm.reg_list & 0x8000)) {
++            // PC was loaded: a return. Leave with the new PC and mode.
++            ExitIndirect(LR);
++        }
++    }
++
 +    // write(LA, regs[rd])
 +    void Write(u8 rd, u8 size) {
 +        PagePointer();
@@ -918,6 +1240,46 @@ index 000000000..9854e32de
 +    }
 +
 +    static bool Supported(const DecodedInst& i) {
++        if (jit_off != 0) {
++            const Opcode op = i.opcode;
++            if (Off(OffHelper) && HelperKind(i) != 0) {
++                return false;
++            }
++            if (Off(OffCarryShift) &&
++                (op == Opcode::Adc || op == Opcode::Sbc || op == Opcode::Rsc ||
++                 op == Opcode::AdcS || op == Opcode::SbcS || op == Opcode::RscS ||
++                 op == Opcode::Mla || op == Opcode::Clz ||
++                 (op >= Opcode::And && op <= Opcode::MvnS && i.dp.rm != 0xFF && i.dp.rs != 0xFF))) {
++                return false;
++            }
++            if (Off(OffVfpMisc) &&
++                (op == Opcode::Vmrs || op == Opcode::Vmsr || op == Opcode::VmovImmS ||
++                 op == Opcode::VmovImmD || op == Opcode::VmovD || op == Opcode::VldrD ||
++                 op == Opcode::VstrD || op == Opcode::VmovArmToD || op == Opcode::VmovDToArm ||
++                 op == Opcode::VldmS || op == Opcode::VstmS || op == Opcode::VldmD ||
++                 op == Opcode::VstmD)) {
++                return false;
++            }
++            if (Off(OffPcWrite) && (op == Opcode::Blx || op == Opcode::BlxImm || WritesPc(i))) {
++                return false;
++            }
++            if (Off(OffFusedLogical) &&
++                (op == Opcode::FusedTstBcc || op == Opcode::FusedTstRegBcc ||
++                 op == Opcode::FusedTeqBcc || op == Opcode::FusedTeqRegBcc ||
++                 op == Opcode::FusedAddCmpBcc || op == Opcode::ArmUnrolledSubsLoop)) {
++                return false;
++            }
++            if (Off(OffVfpSingle) &&
++                (op == Opcode::VaddS || op == Opcode::VsubS || op == Opcode::VmulS ||
++                 op == Opcode::VdivS || op == Opcode::VmlaS || op == Opcode::VmlsS ||
++                 op == Opcode::VnegS || op == Opcode::VmovS || op == Opcode::VldrS ||
++                 op == Opcode::VstrS || op == Opcode::VmovArmToS || op == Opcode::VmovSToArm)) {
++                return false;
++            }
++            if (Off(OffBlockTransfer) && (op == Opcode::Ldm || op == Opcode::Stm)) {
++                return false;
++            }
++        }
 +        switch (i.opcode) {
 +        case Opcode::Nop:
 +        case Opcode::PcSetup:
@@ -931,36 +1293,92 @@ index 000000000..9854e32de
 +        case Opcode::Mov:
 +        case Opcode::Bic:
 +        case Opcode::Mvn:
++            // rd == 15 is a branch (mov pc, lr; add pc, pc, rX, lsl #2)
++            return Op2Supported(i);
 +        case Opcode::AndS:
 +        case Opcode::EorS:
-+        case Opcode::SubS:
-+        case Opcode::RsbS:
-+        case Opcode::AddS:
 +        case Opcode::OrrS:
 +        case Opcode::MovS:
 +        case Opcode::BicS:
 +        case Opcode::MvnS:
++            return i.rd != 15 && Op2CarrySupported(i);
++        case Opcode::Tst:
++        case Opcode::Teq:
++            return Op2CarrySupported(i);
++        case Opcode::SubS:
++        case Opcode::RsbS:
++        case Opcode::AddS:
++        case Opcode::Adc:
++        case Opcode::Sbc:
++        case Opcode::Rsc:
++        case Opcode::AdcS:
++        case Opcode::SbcS:
++        case Opcode::RscS:
 +            return i.rd != 15 && Op2Supported(i);
 +        case Opcode::Cmp:
 +        case Opcode::Cmn:
-+        case Opcode::Tst:
-+        case Opcode::Teq:
 +            return Op2Supported(i);
 +        case Opcode::Uxtb:
 +        case Opcode::Uxth:
 +        case Opcode::Sxtb:
 +        case Opcode::Sxth:
 +        case Opcode::Mul:
++        case Opcode::Mla:
++        case Opcode::Clz:
 +            return i.rd != 15;
++        case Opcode::Vmrs: // rt == 15 moves the comparison flags to the CPSR
++        case Opcode::VmovImmS:
++        case Opcode::VmovImmD:
++        case Opcode::VmovD:
++        case Opcode::VldrD:
++        case Opcode::VstrD:
++            return true;
++        case Opcode::Vmsr:
++            return i.vfp.rt < 15;
++        case Opcode::VldmS:
++        case Opcode::VstmS:
++        case Opcode::VldmD:
++        case Opcode::VstmD:
++            return i.vfp.rn != 15 && i.vfp.sn != 0;
++        case Opcode::VmovArmToD:
++        case Opcode::VmovDToArm:
++            return i.vfp.rt < 15 && i.vfp.rt2 < 15;
 +        case Opcode::B:
 +        case Opcode::Bl:
 +        case Opcode::Bx:
++        case Opcode::Blx:
++        case Opcode::BlxImm:
 +        case Opcode::FusedSubsBcc:
 +        case Opcode::FusedSubsRegBcc:
 +        case Opcode::FusedCmpBcc:
 +        case Opcode::FusedCmpRegBcc:
++        case Opcode::FusedTstBcc:
++        case Opcode::FusedTstRegBcc:
++        case Opcode::FusedTeqBcc:
++        case Opcode::FusedTeqRegBcc:
++        case Opcode::FusedAddCmpBcc:
++        case Opcode::ArmUnrolledSubsLoop:
 +            return true;
-+        case Opcode::Ldr:
++        case Opcode::VaddS:
++        case Opcode::VsubS:
++        case Opcode::VmulS:
++        case Opcode::VdivS:
++        case Opcode::VmlaS:
++        case Opcode::VmlsS:
++        case Opcode::VnegS:
++        case Opcode::VmovS:
++        case Opcode::VldrS:
++        case Opcode::VstrS:
++            return !(jit_exclude & 2);
++        case Opcode::VmovArmToS:
++        case Opcode::VmovSToArm:
++            return !(jit_exclude & 2) && i.vfp.rt < 15;
++        case Opcode::Ldm:
++        case Opcode::Stm:
++            // No S bit (user-mode registers / exception return), a sane register list, and the
++            // base register must not be the PC
++            return !(jit_exclude & 4) && !(i.lsm.flags & 0x02) && i.lsm.count != 0 &&
++                   i.lsm.rn < 15;
 +        case Opcode::LdrB:
 +        case Opcode::LdrH:
 +        case Opcode::LdrSB:
@@ -969,6 +1387,7 @@ index 000000000..9854e32de
 +                return false;
 +            }
 +            [[fallthrough]];
++        case Opcode::Ldr: // rd == 15 is a branch (ldr pc, [..])
 +        case Opcode::Str:
 +        case Opcode::StrB:
 +        case Opcode::StrH:
@@ -977,14 +1396,225 @@ index 000000000..9854e32de
 +        case Opcode::LdrImm:
 +        case Opcode::LdrBImm:
 +        case Opcode::LdrHImm:
-+        case Opcode::LdrLit:
 +            return i.rd != 15;
++        case Opcode::LdrLit:
 +        case Opcode::StrImm:
 +        case Opcode::StrBImm:
 +        case Opcode::StrHImm:
 +            return true;
 +        default:
++            return HelperKind(i) != 0;
++        }
++    }
++
++    // Instructions carried out by JitHelper, a C++ copy of their handlers: 1 = touches only
++    // the VFP state, 2 = reads or writes core registers (the locals are stored before the call
++    // and the registers it wrote are loaded again after it), 0 = not one of them.
++    static int HelperKind(const DecodedInst& i) {
++        switch (i.opcode) {
++        case Opcode::VnmlaS:
++        case Opcode::VnmlsS:
++        case Opcode::VnmulS:
++        case Opcode::VabsS:
++        case Opcode::VsqrtS:
++        case Opcode::VaddD:
++        case Opcode::VsubD:
++        case Opcode::VmulD:
++        case Opcode::VdivD:
++        case Opcode::VmlaD:
++        case Opcode::VmlsD:
++        case Opcode::VnmlaD:
++        case Opcode::VnmlsD:
++        case Opcode::VnmulD:
++        case Opcode::VabsD:
++        case Opcode::VnegD:
++        case Opcode::VsqrtD:
++        case Opcode::VcmpS:
++        case Opcode::VcmpD:
++        case Opcode::VcmpzS:
++        case Opcode::VcmpzD:
++        case Opcode::VcvtSToInt:
++        case Opcode::VcvtIntToS:
++        case Opcode::VcvtDToS:
++        case Opcode::VcvtSToD:
++        case Opcode::VcvtDToInt:
++        case Opcode::VcvtIntToD:
++            return 1;
++        case Opcode::MulS:
++        case Opcode::MlaS:
++            return i.rd != 15 ? 2 : 0;
++        case Opcode::Umull:
++        case Opcode::UmullS:
++        case Opcode::Umlal:
++        case Opcode::UmlalS:
++        case Opcode::Smull:
++        case Opcode::SmullS:
++        case Opcode::Smlal:
++        case Opcode::SmlalS:
++            return i.rd != 15 && i.mul.rdhi != 15 ? 2 : 0;
++        case Opcode::Ldrd:
++        case Opcode::Strd:
++            if (static_cast<u8>(i.ls.mode) > static_cast<u8>(AddrMode::PostIndex) ||
++                (i.ls.rn == 15 && i.ls.mode != AddrMode::Offset)) {
++                return 0;
++            }
++            return i.opcode == Opcode::Strd || (i.rd != 15 && i.ls.rt2 != 15) ? 2 : 0;
++        default:
++            return 0;
++        }
++    }
++    void ReloadReg(u8 r) {
++        e.Ptr(&state.regs[r]);
++        e.Mem(I32Load, 2);
++        used_regs |= 1u << r;
++        e.Set(LREG + r);
++    }
++    void Helper(const DecodedInst& i, int kind) {
++        const DecodedInst* stable = &i;
++        if (!probe) {
++            fallback_pool.push_back(i);
++            stable = &fallback_pool.back();
++        }
++        if (kind == 2) {
++            Flush(e);
++        }
++        e.Ptr(self);
++        e.Ptr(stable);
++        e.Call(&ARM_FastInterp::JitHelper, TypeII_I);
++        e.Op(0x1A); // drop
++        if (kind != 2) {
++            return;
++        }
++        switch (i.opcode) {
++        case Opcode::MulS:
++        case Opcode::MlaS:
++            ReloadReg(i.rd);
++            break;
++        case Opcode::Ldrd:
++            if (i.ls.mode != AddrMode::Offset) {
++                ReloadReg(i.ls.rn);
++            }
++            ReloadReg(i.rd);
++            ReloadReg(i.ls.rt2);
++            break;
++        case Opcode::Strd:
++            if (i.ls.mode != AddrMode::Offset) {
++                ReloadReg(i.ls.rn);
++            }
++            break;
++        default: // long multiplies
++            ReloadReg(i.rd);
++            ReloadReg(i.mul.rdhi);
++            break;
++        }
++        known = Known::Nothing; // some of these set the flags
++    }
++
++    // ADC/SBC/RSC. kind: 0 adc, 1 sbc, 2 rsc
++    void WithCarry(const DecodedInst& i, int kind, bool set_flags) {
++        LoadReg(i.dp.rn);
++        e.Set(LA);
++        Op2(i, false);
++        e.Set(LO);
++        e.Ptr(&state.lazy_flags);
++        e.Call(&JitGetPacked, TypeI_I);
++        e.Const(29);
++        e.Op(ShrU);
++        e.Const(1);
++        e.Op(And);
++        e.Set(LC);
++        if (kind == 0) {
++            e.Get(LA);
++            e.Get(LO);
++            e.Op(Add);
++            e.Get(LC);
++            e.Op(Add);
++        } else {
++            e.Get(kind == 1 ? LA : LO);
++            e.Get(kind == 1 ? LO : LA);
++            e.Op(Sub);
++            e.Const(1);
++            e.Get(LC);
++            e.Op(Sub);
++            e.Op(Sub);
++        }
++        e.Set(LR);
++        BeginStore(i.rd);
++        e.Get(LR);
++        EndStore(i.rd);
++        if (set_flags) {
++            SetFlagOp(kind == 0 ? FlagOp::Adc : kind == 1 ? FlagOp::Sbc : FlagOp::Rsc);
++            StoreFlagField(&state.lazy_flags.result, LR);
++            StoreFlagField(&state.lazy_flags.operand1, LA);
++            StoreFlagField(&state.lazy_flags.operand2, LO);
++            StoreFlagField(&state.lazy_flags.shifter_carry, LC);
++            e.Get(LR);
++            e.Set(LFR);
++            known = Known::Result;
++        }
++    }
++
++    // Can the interpreter run this instruction on its own, returning straight afterwards?
++    // Everything that never leaves its block qualifies; branches, SVCs and writes to the PC
++    // do not.
++    static bool FallbackOk(const DecodedInst& i) {
++        const Opcode op = i.opcode;
++        if (op >= Opcode::And && op <= Opcode::MvnS) {
++            return i.rd != 15;
++        }
++        switch (op) {
++        case Opcode::Invalid:
++        case Opcode::EndBlock:
++        case Opcode::JitCall:
++        case Opcode::PcSetup:
++        case Opcode::B:
++        case Opcode::Bl:
++        case Opcode::Bx:
++        case Opcode::Blx:
++        case Opcode::BlxImm:
++        case Opcode::Swi:
++        case Opcode::Msr:
++        case Opcode::Mcr:
++        case Opcode::FusedSubsBcc:
++        case Opcode::FusedSubsRegBcc:
++        case Opcode::FusedCmpBcc:
++        case Opcode::FusedCmpRegBcc:
++        case Opcode::FusedTstBcc:
++        case Opcode::FusedTstRegBcc:
++        case Opcode::FusedTeqBcc:
++        case Opcode::FusedTeqRegBcc:
++        case Opcode::FusedAddCmpBcc:
++        case Opcode::ThumbFusedSubsBcc:
++        case Opcode::ThumbFusedCmpBcc:
++        case Opcode::ThumbFusedCmpRegBcc:
++        case Opcode::ThumbFusedTstBcc:
++        case Opcode::ThumbUnrolledSubsLoop:
++        case Opcode::ArmUnrolledSubsLoop:
++        case Opcode::ThumbUnrolledCmpLoop:
++        case Opcode::ThumbBCond:
++        case Opcode::ThumbB:
++        case Opcode::ThumbBx:
++        case Opcode::ThumbBlxReg:
++        case Opcode::ThumbBl:
++        case Opcode::ThumbBlxImm:
++        case Opcode::ThumbSwi:
 +            return false;
++        case Opcode::Ldr:
++        case Opcode::LdrB:
++        case Opcode::LdrH:
++        case Opcode::LdrSB:
++        case Opcode::LdrSH:
++        case Opcode::LdrLit:
++        case Opcode::ThumbAddHi:
++        case Opcode::ThumbMovHi:
++            return i.rd != 15;
++        case Opcode::Ldrd:
++            return i.rd != 15 && i.ls.rt2 != 15;
++        case Opcode::Ldm:
++        case Opcode::ThumbPop:
++            return !(i.lsm.reg_list & 0x8000);
++        default:
++            return true;
 +        }
 +    }
 +
@@ -1046,11 +1676,65 @@ index 000000000..9854e32de
 +            EndStore(i.rd);
 +        }
 +        FinishArithmetic(writeback ? FlagOp::Sub : FlagOp::Cmp);
++        FusedBranch(i, block_start);
++    }
++    void FusedBranch(const DecodedInst& i, u32 block_start) {
 +        Cond(i.fused.branch_cond);
 +        e.Op(If);
 +        e.Op(BlockVoid);
++        nest = 1;
 +        TakeBranch(i.fused.branch_target, i.fused.branch_target == block_start);
 +        e.Op(End);
++    }
++
++    // TST/TEQ + B<cond>. The flags are the lazy And/Eor of the separate instructions: C comes
++    // from a rotated immediate (fused.rm == 0xFE) or is preserved, V is preserved.
++    void FusedLogical(const DecodedInst& i, bool reg, bool eor, u32 block_start) {
++        e.Ptr(&state.lazy_flags);
++        e.Call(&JitGetPacked, TypeI_I);
++        e.Const(29);
++        e.Op(ShrU);
++        e.Const(1);
++        e.Op(And);
++        e.Set(LC);
++        if (!reg && i.fused.rm == 0xFE) {
++            e.Const(i.fused.imm >> 31);
++            e.Set(LC);
++        }
++        LoadReg(i.fused.rn);
++        if (reg) {
++            LoadReg(i.fused.rm);
++        } else {
++            e.Const(i.fused.imm);
++        }
++        e.Op(eor ? Xor : And);
++        e.Set(LR);
++        SetFlagOp(eor ? FlagOp::Eor : FlagOp::And);
++        StoreFlagField(&state.lazy_flags.result, LR);
++        StoreFlagField(&state.lazy_flags.shifter_carry, LC);
++        e.Get(LR);
++        e.Set(LFR);
++        known = Known::Result;
++        FusedBranch(i, block_start);
++    }
++
++    // ADD Rd, Rn, #imm; CMP Rd, Rm; B<cond>
++    void FusedAddCmp(const DecodedInst& i, u32 block_start) {
++        BeginStore(i.rd);
++        LoadReg(i.fused.rn);
++        e.Const(i.fused.imm);
++        e.Op(Add);
++        EndStore(i.rd);
++        LoadReg(i.rd);
++        e.Set(LA);
++        LoadReg(i.fused.rm);
++        e.Set(LO);
++        e.Get(LA);
++        e.Get(LO);
++        e.Op(Sub);
++        e.Set(LR);
++        FinishArithmetic(FlagOp::Cmp);
++        FusedBranch(i, block_start);
 +    }
 +
 +    // Logical flag-setting ops. kind: 0 = and, 1 = eor, 2 = orr, 3 = bic, 4 = mov, 5 = mvn
@@ -1124,23 +1808,55 @@ index 000000000..9854e32de
 +        EndStore(i.rd);
 +    }
 +
-+    static bool IsBranch(const DecodedInst& i) {
++    // Translated instructions that write their result to the PC
++    static bool WritesPc(const DecodedInst& i) {
 +        switch (i.opcode) {
-+        case Opcode::B:
-+        case Opcode::Bl:
-+        case Opcode::Bx:
-+        case Opcode::FusedSubsBcc:
-+        case Opcode::FusedSubsRegBcc:
-+        case Opcode::FusedCmpBcc:
-+        case Opcode::FusedCmpRegBcc:
-+            return true;
++        case Opcode::And:
++        case Opcode::Eor:
++        case Opcode::Sub:
++        case Opcode::Rsb:
++        case Opcode::Add:
++        case Opcode::Orr:
++        case Opcode::Mov:
++        case Opcode::Bic:
++        case Opcode::Mvn:
++        case Opcode::Ldr:
++        case Opcode::LdrLit:
++            return i.rd == 15;
 +        default:
 +            return false;
 +        }
 +    }
++    static bool IsBranch(const DecodedInst& i) {
++        switch (i.opcode) {
++        case Opcode::Ldm:
++            return (i.lsm.reg_list & 0x8000) != 0;
++        case Opcode::B:
++        case Opcode::Bl:
++        case Opcode::Bx:
++        case Opcode::Blx:
++        case Opcode::BlxImm:
++            return true;
++        default:
++            return IsFused(i) || WritesPc(i);
++        }
++    }
 +    static bool IsFused(const DecodedInst& i) {
-+        return i.opcode == Opcode::FusedSubsBcc || i.opcode == Opcode::FusedSubsRegBcc ||
-+               i.opcode == Opcode::FusedCmpBcc || i.opcode == Opcode::FusedCmpRegBcc;
++        switch (i.opcode) {
++        case Opcode::FusedSubsBcc:
++        case Opcode::FusedSubsRegBcc:
++        case Opcode::FusedCmpBcc:
++        case Opcode::FusedCmpRegBcc:
++        case Opcode::FusedTstBcc:
++        case Opcode::FusedTstRegBcc:
++        case Opcode::FusedTeqBcc:
++        case Opcode::FusedTeqRegBcc:
++        case Opcode::FusedAddCmpBcc:
++        case Opcode::ArmUnrolledSubsLoop:
++            return true;
++        default:
++            return false;
++        }
 +    }
 +    // Guest bytes the instruction advances the PC by when it does not branch
 +    static u32 SizeOf(const DecodedInst& i) {
@@ -1189,8 +1905,174 @@ index 000000000..9854e32de
 +    }
 +
 +    void Body(const DecodedInst& i, u32 block_start) {
++        if (const int kind = HelperKind(i)) {
++            Helper(i, kind);
++            return;
++        }
 +        switch (i.opcode) {
 +        case Opcode::Nop:
++            break;
++        case Opcode::Adc:
++            WithCarry(i, 0, false);
++            break;
++        case Opcode::Sbc:
++            WithCarry(i, 1, false);
++            break;
++        case Opcode::Rsc:
++            WithCarry(i, 2, false);
++            break;
++        case Opcode::AdcS:
++            WithCarry(i, 0, true);
++            break;
++        case Opcode::SbcS:
++            WithCarry(i, 1, true);
++            break;
++        case Opcode::RscS:
++            WithCarry(i, 2, true);
++            break;
++        case Opcode::Mla:
++            BeginStore(i.rd);
++            LoadReg(i.mul.rm);
++            LoadReg(i.mul.rs);
++            e.Op(Mul);
++            LoadReg(i.mul.rn);
++            e.Op(Add);
++            EndStore(i.rd);
++            break;
++        case Opcode::Clz:
++            BeginStore(i.rd);
++            LoadReg(i.dp.rm);
++            e.Op(0x67); // i32.clz (32 for zero, like the handler)
++            EndStore(i.rd);
++            break;
++        case Opcode::Vmrs:
++            if (i.vfp.rt == 15) {
++                // lazy_flags.SetPacked(fpscr)
++                SetFlagOp(FlagOp::None);
++                e.Ptr(&state.lazy_flags.nzcv);
++                e.Ptr(&state.fpscr);
++                e.Mem(I32Load, 2);
++                e.Const(0xF0000000);
++                e.Op(And);
++                e.Mem(I32Store, 2);
++                known = Known::Nothing;
++            } else {
++                BeginStore(i.vfp.rt);
++                e.Ptr(&state.fpscr);
++                e.Mem(I32Load, 2);
++                EndStore(i.vfp.rt);
++            }
++            break;
++        case Opcode::VldmS:
++        case Opcode::VstmS:
++        case Opcode::VldmD:
++        case Opcode::VstmD: {
++            // vfp.sd = first register, vfp.sn = count, flags bit 0 = writeback, bit 1 = DB mode.
++            // Word by word in ascending order, like the handlers (vpush/vpop, vldmia rN!, {sM})
++            const bool dbl = i.opcode == Opcode::VldmD || i.opcode == Opcode::VstmD;
++            const bool load = i.opcode == Opcode::VldmS || i.opcode == Opcode::VldmD;
++            const u32 words = dbl ? i.vfp.sn * 2u : i.vfp.sn;
++            const u32 first = dbl ? i.vfp.sd * 2u : i.vfp.sd;
++            const bool decrement = (i.vfp.flags & 2) != 0;
++            LoadReg(i.vfp.rn);
++            e.Set(LC);
++            for (u32 w = 0; w < words; ++w) {
++                e.Get(LC);
++                e.Const(w * 4 - (decrement ? words * 4 : 0));
++                e.Op(Add);
++                e.Set(LA);
++                if (load) {
++                    ReadWord();
++                    e.Set(LO);
++                    e.Ptr(&state.vfp_regs[first + w]);
++                    e.Get(LO);
++                    e.Mem(I32Store, 2);
++                } else {
++                    e.Ptr(&state.vfp_regs[first + w]);
++                    e.Mem(I32Load, 2);
++                    e.Set(LO);
++                    WriteWord(LO);
++                }
++            }
++            if (i.vfp.flags & 1) {
++                BeginStore(i.vfp.rn);
++                e.Get(LC);
++                e.Const(decrement ? 0u - words * 4 : words * 4);
++                e.Op(Add);
++                EndStore(i.vfp.rn);
++            }
++            break;
++        }
++        case Opcode::Vmsr:
++            e.Ptr(&state.fpscr);
++            LoadReg(i.vfp.rt);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovImmS:
++            e.Ptr(&state.vfp_regs[i.vimm.sd]);
++            e.Const(i.vimm.lo);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovImmD:
++            e.Ptr(&state.vfp_regs[i.vimm.sd * 2]);
++            e.Const(i.vimm.lo);
++            e.Mem(I32Store, 2);
++            e.Ptr(&state.vfp_regs[i.vimm.sd * 2 + 1]);
++            e.Const(i.vimm.hi);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovD:
++            for (u32 half = 0; half < 2; ++half) {
++                e.Ptr(&state.vfp_regs[i.vfp.sd * 2 + half]);
++                e.Ptr(&state.vfp_regs[i.vfp.sm * 2 + half]);
++                e.Mem(I32Load, 2);
++                e.Mem(I32Store, 2);
++            }
++            break;
++        case Opcode::VmovArmToD:
++            e.Ptr(&state.vfp_regs[i.vfp.sd * 2]);
++            LoadReg(i.vfp.rt);
++            e.Mem(I32Store, 2);
++            e.Ptr(&state.vfp_regs[i.vfp.sd * 2 + 1]);
++            LoadReg(i.vfp.rt2);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovDToArm:
++            BeginStore(i.vfp.rt);
++            e.Ptr(&state.vfp_regs[i.vfp.sd * 2]);
++            e.Mem(I32Load, 2);
++            EndStore(i.vfp.rt);
++            BeginStore(i.vfp.rt2);
++            e.Ptr(&state.vfp_regs[i.vfp.sd * 2 + 1]);
++            e.Mem(I32Load, 2);
++            EndStore(i.vfp.rt2);
++            break;
++        case Opcode::VldrD:
++        case Opcode::VstrD:
++            LoadReg(i.vfp.rn);
++            e.Const(static_cast<u32>(static_cast<s32>(i.vfp.offset)));
++            e.Op(Add);
++            e.Set(LA);
++            for (u32 half = 0; half < 2; ++half) {
++                if (half == 1) {
++                    e.Get(LA);
++                    e.Const(4);
++                    e.Op(Add);
++                    e.Set(LA);
++                }
++                if (i.opcode == Opcode::VldrD) {
++                    ReadWord();
++                    e.Set(LO);
++                    e.Ptr(&state.vfp_regs[i.vfp.sd * 2 + half]);
++                    e.Get(LO);
++                    e.Mem(I32Store, 2);
++                } else {
++                    e.Ptr(&state.vfp_regs[i.vfp.sd * 2 + half]);
++                    e.Mem(I32Load, 2);
++                    e.Set(LO);
++                    WriteWord(LO);
++                }
++            }
 +            break;
 +        case Opcode::Uxtb:
 +            Extend(i, 0);
@@ -1211,8 +2093,89 @@ index 000000000..9854e32de
 +            e.Op(Mul);
 +            EndStore(i.rd);
 +            break;
++        case Opcode::VaddS:
++            VfpS(i, 0);
++            break;
++        case Opcode::VsubS:
++            VfpS(i, 1);
++            break;
++        case Opcode::VmulS:
++            VfpS(i, 2);
++            break;
++        case Opcode::VdivS:
++            VfpS(i, 3);
++            break;
++        case Opcode::VmlaS:
++            VfpS(i, 4);
++            break;
++        case Opcode::VmlsS:
++            VfpS(i, 5);
++            break;
++        case Opcode::VnegS:
++            VfpS(i, 6);
++            break;
++        case Opcode::VmovS:
++            e.Ptr(&state.vfp_regs[i.vfp.sd]);
++            e.Ptr(&state.vfp_regs[i.vfp.sm]);
++            e.Mem(I32Load, 2);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovArmToS:
++            e.Ptr(&state.vfp_regs[i.vfp.sd]);
++            LoadReg(i.vfp.rt);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VmovSToArm:
++            BeginStore(i.vfp.rt);
++            e.Ptr(&state.vfp_regs[i.vfp.sd]);
++            e.Mem(I32Load, 2);
++            EndStore(i.vfp.rt);
++            break;
++        case Opcode::VldrS:
++            LoadReg(i.vfp.rn);
++            e.Const(static_cast<u32>(static_cast<s32>(i.vfp.offset)));
++            e.Op(Add);
++            e.Set(LA);
++            ReadWord();
++            e.Set(LO);
++            e.Ptr(&state.vfp_regs[i.vfp.sd]);
++            e.Get(LO);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::VstrS:
++            LoadReg(i.vfp.rn);
++            e.Const(static_cast<u32>(static_cast<s32>(i.vfp.offset)));
++            e.Op(Add);
++            e.Set(LA);
++            e.Ptr(&state.vfp_regs[i.vfp.sd]);
++            e.Mem(I32Load, 2);
++            e.Set(LO);
++            WriteWord(LO);
++            break;
++        case Opcode::Stm:
++            BlockTransfer(i, false);
++            break;
++        case Opcode::Ldm:
++            BlockTransfer(i, true);
++            break;
 +        case Opcode::FusedSubsBcc:
++        case Opcode::ArmUnrolledSubsLoop: // the same pair, marked as a loop onto itself
 +            Fused(i, false, true, block_start);
++            break;
++        case Opcode::FusedTstBcc:
++            FusedLogical(i, false, false, block_start);
++            break;
++        case Opcode::FusedTstRegBcc:
++            FusedLogical(i, true, false, block_start);
++            break;
++        case Opcode::FusedTeqBcc:
++            FusedLogical(i, false, true, block_start);
++            break;
++        case Opcode::FusedTeqRegBcc:
++            FusedLogical(i, true, true, block_start);
++            break;
++        case Opcode::FusedAddCmpBcc:
++            FusedAddCmp(i, block_start);
 +            break;
 +        case Opcode::FusedSubsRegBcc:
 +            Fused(i, true, true, block_start);
@@ -1359,10 +2322,17 @@ index 000000000..9854e32de
 +
 +    void Instruction(const DecodedInst& i, u32 block_start) {
 +        ticks_done += i.opcode == Opcode::PcSetup ? 0 : i.ticks;
++        const u32 inst_pc = pc;
++        pc += SizeOf(i);
++        if (!Supported(i)) {
++            Fallback(i);
++            return;
++        }
 +        // Fused instructions are only created from unconditional pairs (no CHECK_COND)
 +        const bool conditional = i.cond != 0xE && i.opcode != Opcode::PcSetup &&
 +                                 i.opcode != Opcode::Nop && !IsFused(i);
-+        if (i.opcode == Opcode::B || i.opcode == Opcode::Bl || i.opcode == Opcode::Bx) {
++        if (i.opcode == Opcode::B || i.opcode == Opcode::Bl || i.opcode == Opcode::Bx ||
++            i.opcode == Opcode::Blx || i.opcode == Opcode::BlxImm) {
 +            // Always inside an `if` so that TakeBranch/Exit see the same nesting
 +            if (conditional) {
 +                Cond(i.cond);
@@ -1371,6 +2341,7 @@ index 000000000..9854e32de
 +            }
 +            e.Op(If);
 +            e.Op(BlockVoid);
++            nest = 1;
 +            if (i.opcode == Opcode::B) {
 +                TakeBranch(i.branch.target, i.branch.target == block_start);
 +            } else if (i.opcode == Opcode::Bl) {
@@ -1378,24 +2349,32 @@ index 000000000..9854e32de
 +                e.Const(i.branch.lr);
 +                EndStore(14);
 +                TakeBranch(i.branch.target, false);
-+            } else {
-+                LoadReg(i.branch.rm);
-+                e.Set(LA);
++            } else if (i.opcode == Opcode::BlxImm) {
++                // Always changes the instruction set, so it always leaves
++                BeginStore(14);
++                e.Const(i.branch.lr);
++                EndStore(14);
 +                Flush(e);
 +                e.Ptr(&state.thumb_mode);
-+                e.Get(LA);
-+                e.Const(1);
-+                e.Op(And);
++                e.Const(i.branch.rm != 0 ? 1 : 0);
 +                e.Mem(I32Store8, 0);
 +                e.Ptr(&state.regs[15]);
-+                e.Get(LA);
-+                e.Const(0xFFFFFFFE);
-+                e.Op(And);
++                e.Const(i.branch.target);
 +                e.Mem(I32Store, 2);
 +                e.Get(LT);
 +                e.Const(ticks_done);
 +                e.Op(Add);
 +                Exit();
++            } else {
++                if (i.opcode == Opcode::Blx) {
++                    // LR is written first: `blx lr` jumps to the new value, as in the handler
++                    BeginStore(14);
++                    e.Const(inst_pc + 4);
++                    EndStore(14);
++                }
++                LoadReg(i.branch.rm);
++                e.Set(LA);
++                ExitIndirect(LA);
 +            }
 +            e.Op(End);
 +            return;
@@ -1406,7 +2385,11 @@ index 000000000..9854e32de
 +            e.Op(BlockVoid);
 +        }
 +        const Known before = known;
++        nest = conditional ? 1 : 0;
 +        Body(i, block_start);
++        if (WritesPc(i)) {
++            ExitToWrittenPc();
++        }
 +        if (conditional) {
 +            e.Op(End);
 +            // A flag-setting instruction that may not have run leaves the flags unknown
@@ -1491,16 +2474,51 @@ index 000000000..9854e32de
 +});
 +
 +namespace {
-+bool FullySupported(const BasicBlock* block) {
-+    if (block->inst_count == 0) {
++// Can the whole block go into a region? Instructions without a translation are run by the
++// interpreter one at a time, which costs more than interpreting them in place, so a block that
++// is mostly made of those is left alone.
++bool Eligible(const std::vector<DecodedInst>& insts) {
++    if (insts.empty()) {
 +        return false;
 +    }
-+    for (u32 i = 0; i < block->inst_count; ++i) {
-+        if (!JitCompiler::Supported(block->instructions[i])) {
++    u32 fallbacks = 0;
++    for (const DecodedInst& inst : insts) {
++        if (JitCompiler::Supported(inst)) {
++            continue;
++        }
++        if (!JitCompiler::FallbackOk(inst)) {
++            return false;
++        }
++        ++fallbacks;
++    }
++    return fallbacks * 8 <= insts.size() && !(fallbacks != 0 && Off(OffFallback));
++}
++// Copies the block's instructions as the decoder produced them. A block that is already the
++// root of a region has had its first instruction replaced with the JitCall; the region's record
++// keeps the original, so that such a block can still join other regions.
++bool Snapshot(const void* owner, const BasicBlock* block, std::vector<DecodedInst>& out) {
++    out.assign(block->instructions.begin(), block->instructions.begin() + block->inst_count);
++    if (out.empty()) {
++        return false;
++    }
++    if (out[0].opcode == Opcode::JitCall) {
++        if (Off(OffRejoin) || out[0].jit.size != 0 || out[0].jit.count != block->inst_count) {
++            return false; // a partly compiled block
++        }
++        bool found = false;
++        for (size_t i = regions.size(); i-- > 0;) {
++            const RegionRecord& r = regions[i];
++            if (r.owner == owner && r.root_pc == block->start_pc && r.thumb == block->IsThumb()) {
++                out[0] = r.original;
++                found = true;
++                break;
++            }
++        }
++        if (!found) {
 +            return false;
 +        }
 +    }
-+    return true;
++    return Eligible(out);
 +}
 +// An unconditional branch that always leaves the block
 +bool EndsBlock(const DecodedInst& inst) {
@@ -1508,32 +2526,280 @@ index 000000000..9854e32de
 +}
 +} // namespace
 +
-+bool ARM_FastInterp::JitCompileRegion(BasicBlock* root) {
-+    if (!FullySupported(root)) {
-+        return false;
++// Runs one instruction in the interpreter on behalf of compiled code. The instruction is put in
++// a block of its own, ended by an Invalid slot: unlike EndBlock, that returns without chaining
++// to whatever follows.
++u32 ARM_FastInterp::JitFallback(ARM_FastInterp* self, const DecodedInst* inst) {
++    static BasicBlock scratch{};
++    scratch.start_pc = 0xFFFFFFFF;
++    scratch.inst_count = 1;
++    scratch.exec_count = 0;
++    scratch.flags = BLOCK_FLAG_HOT | (self->state_.thumb_mode ? BLOCK_FLAG_THUMB : 0);
++    scratch.chain_target = nullptr;
++    scratch.instructions[0] = *inst;
++    scratch.instructions[1].opcode = Opcode::Invalid;
++    self->ExecuteBlock(&scratch);
++    return 0;
++}
++
++// Instructions that compiled code carries out through a call: the bodies are those of the
++// handlers in handlers/*.inc, without the condition check (the caller has done it) and without
++// the dispatch. Keep the two in step.
++u32 ARM_FastInterp::JitHelper(ARM_FastInterp* self, const DecodedInst* inst) {
++    InterpreterState& state_ = self->state_;
++    u8** const pages = state_.page_pointers;
++    const auto MemRead32 = [&](u32 addr) -> u32 {
++        const u8* page = pages[addr >> FASTINTERP_PAGE_BITS];
++        if (page != nullptr) {
++            u32 value;
++            std::memcpy(&value, &page[addr & FASTINTERP_PAGE_MASK], 4);
++            return value;
++        }
++        return self->memory_.Read32(addr);
++    };
++    const auto MemWrite32 = [&](u32 addr, u32 value) {
++        u8* page = pages[addr >> FASTINTERP_PAGE_BITS];
++        if (page != nullptr) {
++            std::memcpy(&page[addr & FASTINTERP_PAGE_MASK], &value, 4);
++            return;
++        }
++        self->memory_.Write32(addr, value);
++    };
++    const auto S = [&](u32 index) { return std::bit_cast<float>(state_.vfp_regs[index]); };
++    const auto SetS = [&](u32 index, float value) {
++        state_.vfp_regs[index] = std::bit_cast<u32>(value);
++    };
++    const auto D = [&](u32 index) {
++        double value;
++        std::memcpy(&value, &state_.vfp_regs[index * 2], sizeof(value));
++        return value;
++    };
++    const auto SetD = [&](u32 index, double value) {
++        std::memcpy(&state_.vfp_regs[index * 2], &value, sizeof(value));
++    };
++    const auto Compare = [&](auto a, auto b) {
++        u32 flags;
++        if (std::isnan(a) || std::isnan(b)) {
++            flags = 0x30000000; // C=1, V=1 (unordered)
++        } else if (a == b) {
++            flags = 0x60000000; // Z=1, C=1
++        } else if (a < b) {
++            flags = 0x80000000; // N=1
++        } else {
++            flags = 0x20000000; // C=1
++        }
++        state_.fpscr = (state_.fpscr & 0x0FFFFFFF) | flags;
++    };
++    const auto LongFlags = [&](u64 result) {
++        state_.lazy_flags.Materialize();
++        state_.lazy_flags.op = FlagOp::Mul;
++        state_.lazy_flags.result =
++            static_cast<u32>(result >> 32) | (static_cast<u32>(result) ? 1u : 0u);
++    };
++    const u8 sd = inst->vfp.sd, sn = inst->vfp.sn, sm = inst->vfp.sm;
++    switch (inst->opcode) {
++    case Opcode::VnmlaS:
++        SetS(sd, -S(sd) - S(sn) * S(sm));
++        break;
++    case Opcode::VnmlsS:
++        SetS(sd, -S(sd) + S(sn) * S(sm));
++        break;
++    case Opcode::VnmulS:
++        SetS(sd, -(S(sn) * S(sm)));
++        break;
++    case Opcode::VabsS:
++        SetS(sd, std::fabs(S(sm)));
++        break;
++    case Opcode::VsqrtS:
++        SetS(sd, std::sqrt(S(sm)));
++        break;
++    case Opcode::VaddD:
++        SetD(sd, D(sn) + D(sm));
++        break;
++    case Opcode::VsubD:
++        SetD(sd, D(sn) - D(sm));
++        break;
++    case Opcode::VmulD:
++        SetD(sd, D(sn) * D(sm));
++        break;
++    case Opcode::VdivD:
++        SetD(sd, D(sn) / D(sm));
++        break;
++    case Opcode::VmlaD:
++        SetD(sd, D(sd) + D(sn) * D(sm));
++        break;
++    case Opcode::VmlsD:
++        SetD(sd, D(sd) - D(sn) * D(sm));
++        break;
++    case Opcode::VnmlaD:
++        SetD(sd, -D(sd) - D(sn) * D(sm));
++        break;
++    case Opcode::VnmlsD:
++        SetD(sd, -D(sd) + D(sn) * D(sm));
++        break;
++    case Opcode::VnmulD:
++        SetD(sd, -(D(sn) * D(sm)));
++        break;
++    case Opcode::VabsD:
++        SetD(sd, std::fabs(D(sm)));
++        break;
++    case Opcode::VnegD:
++        SetD(sd, -D(sm));
++        break;
++    case Opcode::VsqrtD:
++        SetD(sd, std::sqrt(D(sm)));
++        break;
++    case Opcode::VcmpS:
++        Compare(S(sd), S(sm));
++        break;
++    case Opcode::VcmpD:
++        Compare(D(sd), D(sm));
++        break;
++    case Opcode::VcmpzS:
++        Compare(S(sd), 0.0f);
++        break;
++    case Opcode::VcmpzD:
++        Compare(D(sd), 0.0);
++        break;
++    case Opcode::VcvtSToInt: {
++        const float val = S(sm);
++        const s32 result = (inst->vfp.flags & 1) ? static_cast<s32>(static_cast<u32>(val))
++                                                 : static_cast<s32>(val);
++        state_.vfp_regs[sd] = static_cast<u32>(result);
++        break;
 +    }
++    case Opcode::VcvtIntToS: {
++        const u32 bits = state_.vfp_regs[sm];
++        SetS(sd, (inst->vfp.flags & 1) ? static_cast<float>(bits)
++                                       : static_cast<float>(static_cast<s32>(bits)));
++        break;
++    }
++    case Opcode::VcvtDToS:
++        SetS(sd, static_cast<float>(D(sm)));
++        break;
++    case Opcode::VcvtSToD:
++        SetD(sd, static_cast<double>(S(sm)));
++        break;
++    case Opcode::VcvtDToInt: {
++        const double val = D(sm);
++        const s32 result = (inst->vfp.flags & 1) ? static_cast<s32>(static_cast<u32>(val))
++                                                 : static_cast<s32>(val);
++        state_.vfp_regs[sd] = static_cast<u32>(result);
++        break;
++    }
++    case Opcode::VcvtIntToD: {
++        const u32 bits = state_.vfp_regs[sm];
++        SetD(sd, (inst->vfp.flags & 1) ? static_cast<double>(bits)
++                                       : static_cast<double>(static_cast<s32>(bits)));
++        break;
++    }
++    case Opcode::MulS:
++    case Opcode::MlaS: {
++        u32 result = state_.regs[inst->mul.rm] * state_.regs[inst->mul.rs];
++        if (inst->opcode == Opcode::MlaS) {
++            result += state_.regs[inst->mul.rn];
++        }
++        state_.regs[inst->rd] = result;
++        state_.lazy_flags.Materialize();
++        state_.lazy_flags.op = FlagOp::Mul;
++        state_.lazy_flags.result = result;
++        break;
++    }
++    case Opcode::Umull:
++    case Opcode::UmullS:
++    case Opcode::Umlal:
++    case Opcode::UmlalS: {
++        u64 result = static_cast<u64>(state_.regs[inst->mul.rm]) * state_.regs[inst->mul.rs];
++        if (inst->opcode == Opcode::Umlal || inst->opcode == Opcode::UmlalS) {
++            result += (static_cast<u64>(state_.regs[inst->mul.rdhi]) << 32) | state_.regs[inst->rd];
++        }
++        state_.regs[inst->rd] = static_cast<u32>(result);
++        state_.regs[inst->mul.rdhi] = static_cast<u32>(result >> 32);
++        if (inst->opcode == Opcode::UmullS || inst->opcode == Opcode::UmlalS) {
++            LongFlags(result);
++        }
++        break;
++    }
++    case Opcode::Smull:
++    case Opcode::SmullS:
++    case Opcode::Smlal:
++    case Opcode::SmlalS: {
++        // Unsigned arithmetic gives the same bits as the handlers' signed expressions
++        u64 result = static_cast<u64>(static_cast<s64>(static_cast<s32>(state_.regs[inst->mul.rm])) *
++                                      static_cast<s32>(state_.regs[inst->mul.rs]));
++        if (inst->opcode == Opcode::Smlal || inst->opcode == Opcode::SmlalS) {
++            result += (static_cast<u64>(state_.regs[inst->mul.rdhi]) << 32) | state_.regs[inst->rd];
++        }
++        state_.regs[inst->rd] = static_cast<u32>(result);
++        state_.regs[inst->mul.rdhi] = static_cast<u32>(result >> 32);
++        if (inst->opcode == Opcode::SmullS || inst->opcode == Opcode::SmlalS) {
++            LongFlags(result);
++        }
++        break;
++    }
++    case Opcode::Ldrd:
++    case Opcode::Strd: {
++        const u32 addr = state_.regs[inst->ls.rn];
++        s32 offset = inst->ls.offset;
++        if (inst->ls.rm != 0xFF) {
++            offset = static_cast<s32>(state_.regs[inst->ls.rm]);
++            if (!(inst->ls.flags & 0x01)) {
++                offset = static_cast<s32>(0u - static_cast<u32>(offset));
++            }
++        }
++        u32 effective_addr = addr + offset;
++        if (inst->ls.mode == AddrMode::PreIndex) {
++            state_.regs[inst->ls.rn] = effective_addr;
++        } else if (inst->ls.mode == AddrMode::PostIndex) {
++            effective_addr = addr;
++            state_.regs[inst->ls.rn] = addr + offset;
++        }
++        if (inst->opcode == Opcode::Ldrd) {
++            state_.regs[inst->rd] = MemRead32(effective_addr);
++            state_.regs[inst->ls.rt2] = MemRead32(effective_addr + 4);
++        } else {
++            MemWrite32(effective_addr, state_.regs[inst->rd]);
++            MemWrite32(effective_addr + 4, state_.regs[inst->ls.rt2]);
++        }
++        break;
++    }
++    default:
++        break;
++    }
++    return 0;
++}
++
++bool ARM_FastInterp::JitCompileRegion(BasicBlock* root) {
 +    // Collect the root and the blocks its branches lead to, breadth first. Only blocks that are
 +    // already decoded, translatable from start to end and in the same mode can join.
-+    std::vector<const BasicBlock*> members{root};
++    std::vector<std::vector<DecodedInst>> members(1);
++    if (!Snapshot(this, root, members[0])) {
++        return false;
++    }
 +    std::vector<u32> pcs{root->start_pc};
 +    std::vector<u32> ends;
++    std::vector<u32> return_pcs; // Addresses that follow a call made inside the region
 +    u32 total = root->inst_count;
 +    for (size_t m = 0; m < members.size(); ++m) {
-+        const BasicBlock* block = members[m];
-+        u32 pc = block->start_pc;
++        u32 pc = pcs[m];
 +        std::vector<u32> targets;
-+        for (u32 i = 0; i < block->inst_count; ++i) {
-+            const DecodedInst& inst = block->instructions[i];
++        for (const DecodedInst& inst : members[m]) {
 +            u32 target;
 +            if (JitCompiler::StaticTarget(inst, target)) {
 +                targets.push_back(target);
 +            } else if (inst.opcode == Opcode::Bl) {
++                // The callee, and where it will return to
 +                targets.push_back(inst.branch.target);
++                targets.push_back(inst.branch.lr & ~1u);
++                return_pcs.push_back(inst.branch.lr & ~1u);
++            } else if (inst.opcode == Opcode::Blx) {
++                targets.push_back(pc + 4);
++                return_pcs.push_back(pc + 4);
 +            }
 +            pc += JitCompiler::SizeOf(inst);
 +        }
 +        ends.push_back(pc);
-+        if (!EndsBlock(block->instructions[block->inst_count - 1])) {
++        if (!EndsBlock(members[m].back())) {
 +            targets.push_back(pc);
 +        }
 +        for (const u32 target : targets) {
@@ -1542,13 +2808,22 @@ index 000000000..9854e32de
 +                continue;
 +            }
 +            const BasicBlock* next = cache_.Lookup(target);
-+            if (next == nullptr || next->IsThumb() != root->IsThumb() || !FullySupported(next) ||
-+                total + next->inst_count > MAX_REGION_INSTRUCTIONS) {
++            std::vector<DecodedInst> insts;
++            if (next == nullptr || next->IsThumb() != root->IsThumb() ||
++                total + next->inst_count > MAX_REGION_INSTRUCTIONS ||
++                !Snapshot(this, next, insts)) {
 +                continue;
 +            }
-+            members.push_back(next);
++            members.push_back(std::move(insts));
 +            pcs.push_back(target);
 +            total += next->inst_count;
++        }
++    }
++
++    std::vector<u32> returns;
++    for (u32 m = 0; m < pcs.size() && returns.size() < MAX_REGION_RETURNS && !Off(OffReturns); ++m) {
++        if (std::find(return_pcs.begin(), return_pcs.end(), pcs[m]) != return_pcs.end()) {
++            returns.push_back(m);
 +        }
 +    }
 +
@@ -1556,6 +2831,9 @@ index 000000000..9854e32de
 +        Emitter& e = c.e;
 +        const u32 n = static_cast<u32>(members.size());
 +        c.region_pcs = pcs;
++        c.region_returns = returns;
++        c.region_thumb = root->IsThumb();
++        c.self = this;
 +        // loop { block*n { br_table(next) } code 0 } code 1 } ... } : block i's code follows the
 +        // end of the i-th innermost block, and every block ends by leaving or re-dispatching
 +        e.Byte(0x03);
@@ -1574,17 +2852,18 @@ index 000000000..9854e32de
 +        for (u32 m = 0; m < n; ++m) {
 +            e.Byte(0x0B);
 +            c.region_block = m;
++            c.pc = pcs[m];
 +            c.ticks_done = 0;
 +            c.known = JitCompiler::Known::Nothing;
-+            const BasicBlock* block = members[m];
-+            for (u32 i = 0; i < block->inst_count; ++i) {
-+                c.Instruction(block->instructions[i], 0xFFFFFFFF);
++            for (const DecodedInst& inst : members[m]) {
++                c.Instruction(inst, 0xFFFFFFFF);
 +            }
-+            if (!EndsBlock(block->instructions[block->inst_count - 1])) {
++            if (!EndsBlock(members[m].back())) {
 +                // Ran off the end of the block: continue at the next address
 +                e.Const(1);
 +                e.Byte(0x04);
 +                e.Byte(0x40);
++                c.nest = 1;
 +                c.TakeBranch(ends[m], false);
 +                e.Byte(0x0B);
 +            }
@@ -1595,9 +2874,11 @@ index 000000000..9854e32de
 +    };
 +
 +    JitCompiler probe{{}, state_, &memory_};
++    probe.probe = true;
 +    emit(probe);
 +    JitCompiler compiler{{}, state_, &memory_};
 +    compiler.flush_regs = probe.written_regs;
++    compiler.reload_regs = probe.used_regs;
 +    emit(compiler);
 +    const std::vector<u8> module = compiler.Module();
 +    const u32 fn = JitInstall(module.data(), static_cast<u32>(module.size()));
@@ -1611,7 +2892,15 @@ index 000000000..9854e32de
 +        low = std::min(low, pcs[m]);
 +        high = std::max(high, ends[m]);
 +    }
-+    regions.push_back({this, root->start_pc, low, high});
++    // A record left behind by an earlier compilation of this block (the cache dropped the block
++    // and it was decoded again) must not shadow the new one
++    regions.erase(std::remove_if(regions.begin(), regions.end(),
++                                 [&](const RegionRecord& r) {
++                                     return r.owner == this && r.root_pc == root->start_pc &&
++                                            r.thumb == root->IsThumb();
++                                 }),
++                  regions.end());
++    regions.push_back({this, root->start_pc, low, high, root->IsThumb(), members[0][0]});
 +    DecodedInst& call = root->instructions[0];
 +    call.opcode = Opcode::JitCall;
 +    call.cond = 0xE;
@@ -1659,8 +2948,14 @@ index 000000000..9854e32de
 +            ++unsupported[static_cast<size_t>(inst.opcode) % unsupported.size()];
 +        }
 +    }
-+    if (JitCompileRegion(block)) {
++    if (!Off(OffRegions) && JitCompileRegion(block)) {
 +        return;
++    }
++    // Addresses of the instructions, taken before any of them is replaced with a JitCall
++    std::array<u32, MAX_BLOCK_SIZE + 1> inst_pcs{};
++    inst_pcs[0] = block->start_pc;
++    for (u32 i = 0; i < count; ++i) {
++        inst_pcs[i + 1] = inst_pcs[i] + JitCompiler::SizeOf(block->instructions[i]);
 +    }
 +    u32 start = 0;
 +    while (start < count) {
@@ -1682,10 +2977,14 @@ index 000000000..9854e32de
 +            start = end + (end == start ? 1 : 0);
 +            continue;
 +        }
++        const u32 run_pc = inst_pcs[start];
 +        // First pass: find out which registers the run writes (exits must store them back)
 +        u32 flush_regs = 0;
 +        {
 +            JitCompiler probe{{}, state_, &memory_};
++            probe.probe = true;
++            probe.pc = run_pc;
++            probe.self = this;
 +            for (u32 i = start; i < end; ++i) {
 +                probe.Instruction(block->instructions[i], 0xFFFFFFFF);
 +            }
@@ -1693,6 +2992,8 @@ index 000000000..9854e32de
 +        }
 +        JitCompiler compiler{{}, state_, &memory_};
 +        compiler.flush_regs = flush_regs;
++        compiler.pc = run_pc;
++        compiler.self = this;
 +        if (start == 0) {
 +            for (u32 i = start; i < end; ++i) {
 +                u32 target;
@@ -1733,6 +3034,8 @@ index 000000000..9854e32de
 +// Called by the frontend before a game is loaded
 +EMSCRIPTEN_KEEPALIVE void web_jit_set_enabled(int enabled) {
 +    Core::FastInterp::jit_enabled = enabled != 0;
++    Core::FastInterp::jit_off = static_cast<unsigned>(enabled) & ~1u;
++    Core::FastInterp::jit_exclude = static_cast<unsigned>(enabled) & ~1u;
 +}
 +EMSCRIPTEN_KEEPALIVE unsigned web_jit_function_count() {
 +    return Core::FastInterp::jit_functions;
@@ -1740,6 +3043,7 @@ index 000000000..9854e32de
 +
 +// Ticks executed by compiled code and in total (counted by the interpreter loop)
 +unsigned long long web_jit_ticks = 0;
++unsigned long long web_jit_calls = 0;
 +unsigned long long web_total_ticks = 0;
 +
 +// Share of the emulated CPU time spent in compiled code since the last call, in percent
@@ -1769,6 +3073,8 @@ index 000000000..9854e32de
 +        n += std::snprintf(line + n, sizeof(line) - n, " %u:%u", sorted[i].second, sorted[i].first);
 +    }
 +    std::fprintf(stderr, "%s\n", line);
++    std::fprintf(stderr, "JIT: calls %llu, slow reads %llu, slow writes %llu, regions %zu\n",
++                 web_jit_calls, slow_reads, slow_writes, regions.size());
 +}
 +}
 +
