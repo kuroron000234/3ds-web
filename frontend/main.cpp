@@ -29,6 +29,8 @@
 #include <vector>
 
 #include <emscripten.h>
+#include "core/core.h"
+#include "core/memory.h"
 #include <emscripten/html5.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
@@ -614,8 +616,15 @@ struct OptionRequest {
     const char* value;
 };
 
+extern "C" void web_jit_set_enabled(int enabled);
+
 void SetOptionOnEmuThread(void* arg) {
     auto* req = static_cast<OptionRequest*>(arg);
+    // コアの設定ではなく、Web 版の JIT（熱いブロックを WASM に変換）の入/切
+    if (std::string(req->key) == "web_jit") {
+        web_jit_set_enabled(std::string(req->value) != "disabled");
+        return;
+    }
     options[req->key] = req->value;
 }
 
@@ -717,6 +726,11 @@ EMSCRIPTEN_KEEPALIVE double web_get_prof(int slot) {
         return overhead_percent.load(std::memory_order_relaxed); // 遅れている間の retro_run の外
     }
     return slot >= 0 && slot < 3 ? prof_percent[slot].load(std::memory_order_relaxed) : 0.0;
+}
+
+// JS から呼ぶ（テスト用）: ゲーム側のメモリを 32 ビット読む。CPU ベンチマークの記録を読むのに使う。
+EMSCRIPTEN_KEEPALIVE unsigned web_peek32(unsigned addr) {
+    return game_loaded ? Core::System::GetInstance().Memory().Read32(addr) : 0;
 }
 
 // JS から呼ぶ: 入力の共有領域（int32 × 8、配置は input_state の説明を参照）。

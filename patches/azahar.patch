@@ -45,7 +45,7 @@ index ba8cae289..ed645575e 100644
          FinishPendingSleep();
          sleep_reply_frames = 2;
 diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
-index e28f9941b..983f1ae01 100644
+index e28f9941b..49aaa618f 100644
 --- a/src/citra_libretro/CMakeLists.txt
 +++ b/src/citra_libretro/CMakeLists.txt
 @@ -99,3 +99,35 @@ else()
@@ -74,10 +74,10 @@ index e28f9941b..983f1ae01 100644
 +            # The frontend runs the core on its own pthread, which owns the canvas as an
 +            # OffscreenCanvas (WebGL2 or 2D) so the browser main thread never blocks.
 +            -sOFFSCREENCANVAS_SUPPORT
-+            -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
++            -sALLOW_MEMORY_GROWTH -sALLOW_TABLE_GROWTH -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648
 +            -sPTHREAD_POOL_SIZE=11 -sSTACK_SIZE=5242880
 +            -sFORCE_FILESYSTEM
-+            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_get_prof,_web_input_ptr,_web_audio_ptr,_web_tick
++            -sEXPORTED_FUNCTIONS=_main,_web_load_game,_web_load_state,_web_mount_rom,_web_set_option,_web_get_frame_count,_web_get_frame_ms,_web_get_speed,_web_get_busy,_web_get_prof,_web_jit_set_enabled,_web_jit_function_count,_web_peek32,_web_input_ptr,_web_audio_ptr,_web_tick
 +            # Name the C++ exception and the functions on its stack when a thread dies of one
 +            --pre-js ${WEB_FRONTEND_DIR}/pre.js
 +            -sEXCEPTION_STACK_TRACES -sEXPORT_EXCEPTION_HANDLING_HELPERS --profiling-funcs
@@ -233,11 +233,14 @@ index a2bbc01dc..fdfde9784 100644
  // Splits URL into its components. Example: https://citra-emu.org:443/index.html
  // is_https: true; host: citra-emu.org; port: 443; path: /index.html
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 814863e52..282c30c60 100644
+index 814863e52..0cde3e591 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
-@@ -577,6 +577,14 @@ if (NOT MSVC)
+@@ -575,8 +575,17 @@ if (NOT MSVC)
+         arm/fastinterp/fastinterp_cache.h
+         arm/fastinterp/fastinterp_decode.cpp
          arm/fastinterp/fastinterp_flags.h
++        arm/fastinterp/fastinterp_jit_web.cpp
          arm/fastinterp/fastinterp_types.h
      )
 +    # FastInterp uses the instruction tick table, which is otherwise only
@@ -251,6 +254,1192 @@ index 814863e52..282c30c60 100644
  endif()
  
  if (CITRA_USE_PRECOMPILED_HEADERS)
+diff --git a/src/core/arm/fastinterp/fastinterp.cpp b/src/core/arm/fastinterp/fastinterp.cpp
+index cd24691b6..9487062f9 100644
+--- a/src/core/arm/fastinterp/fastinterp.cpp
++++ b/src/core/arm/fastinterp/fastinterp.cpp
+@@ -527,6 +527,7 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+         // PC-source elimination
+         HANDLER(LdrLit),
+         HANDLER(PcSetup),
++        HANDLER(JitCall),
+     };
+ #undef HANDLER
+ 
+@@ -786,6 +787,24 @@ u64 ARM_FastInterp::ExecuteBlock(BasicBlock* block) {
+ #include "handlers/fused.inc"
+     // clang-format on
+ 
++handle_JitCall: {
++#ifdef __EMSCRIPTEN__
++    // The compiled run returns its ticks << 1, with bit 0 set if it took a branch (it then
++    // wrote the target to regs[15]). Otherwise it executed all `count` instructions.
++    const u32 jit_result = reinterpret_cast<u32 (*)()>(inst->jit.fn)();
++    executed += jit_result >> 1;
++    if (jit_result & 1) {
++        SET_PC(state_.regs[15]);
++        goto chain;
++    }
++    SET_PC(GET_PC() + inst->jit.size);
++    inst += inst->jit.count;
++    goto* dispatch_table[static_cast<size_t>(inst->opcode)];
++#else
++    goto done;
++#endif
++}
++
+ chain:
+     SYNC_PC();
+ 
+@@ -847,6 +866,9 @@ done:
+         fusion_stats_.hot_blocks_detected++;
+         if (!disable_reoptimization_) {
+             ReoptimizeHotBlock(block);
++#ifdef __EMSCRIPTEN__
++            JitCompileBlock(block);
++#endif
+         }
+     }
+ 
+diff --git a/src/core/arm/fastinterp/fastinterp.h b/src/core/arm/fastinterp/fastinterp.h
+index bb1d46451..2561ae573 100644
+--- a/src/core/arm/fastinterp/fastinterp.h
++++ b/src/core/arm/fastinterp/fastinterp.h
+@@ -111,6 +111,10 @@ private:
+ 
+     /// Reoptimize a hot block (apply additional optimizations after detection)
+     void ReoptimizeHotBlock(BasicBlock* block);
++#ifdef __EMSCRIPTEN__
++    /// Compile the translatable runs of a hot block to WebAssembly (fastinterp_jit_web.cpp)
++    void JitCompileBlock(BasicBlock* block);
++#endif
+ 
+     Memory::MemorySystem& memory_;
+     InterpreterState state_;
+diff --git a/src/core/arm/fastinterp/fastinterp_jit_web.cpp b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
+new file mode 100644
+index 000000000..93561daf1
+--- /dev/null
++++ b/src/core/arm/fastinterp/fastinterp_jit_web.cpp
+@@ -0,0 +1,1088 @@
++// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the misc/licenses/gplv2.txt file included.
++
++// WebAssembly block compiler for the web build.
++//
++// The interpreter's dispatch costs far more in WebAssembly than natively: computed goto is
++// lowered to a single branch table and every handler re-reads its decoded operands. So when a
++// block becomes hot, each run of consecutive instructions this file knows how to translate is
++// compiled into one WebAssembly function with the operands baked in as constants, and the first
++// instruction of the run is replaced with a JitCall that invokes it and skips the rest.
++// A run may contain branches: the function returns (ticks << 1) | 1 after writing the target to
++// regs[15] when one is taken, and (ticks << 1) when it runs off its end. A branch back to the
++// start of the block becomes a WebAssembly loop, bounded like the interpreter's block chaining.
++// Anything not translated (VFP, block transfers, ...) keeps running in the interpreter, so
++// coverage can grow one opcode at a time. Each translation must mirror its handler in
++// handlers/*.inc exactly, including the order of register writes.
++
++#ifdef __EMSCRIPTEN__
++
++#include <vector>
++#include <emscripten.h>
++#include "common/logging/log.h"
++#include "core/arm/fastinterp/fastinterp.h"
++#include "core/memory.h"
++
++namespace Core::FastInterp {
++
++namespace {
++
++bool jit_enabled = true;
++u32 jit_functions = 0;
++constexpr u32 MAX_JIT_FUNCTIONS = 200000;
++constexpr u32 MIN_RUN_LENGTH = 3;
++constexpr u32 MIN_BRANCH_RUN_LENGTH = 2;
++// Iterations of a self-loop per call (the interpreter chains at most 16 blocks per slice check)
++constexpr u32 MAX_LOOP_ITERATIONS = 16;
++
++// Helpers the generated code reaches through the function table (call_indirect).
++u32 JitCond(LazyFlags* flags, u32 cond) {
++    flags->Materialize();
++    return CondPassed(static_cast<u8>(cond), flags->nzcv);
++}
++u32 JitGetPacked(LazyFlags* flags) {
++    return flags->GetPacked();
++}
++u32 JitRead8(Memory::MemorySystem* memory, u32 addr) {
++    return memory->Read8(addr);
++}
++u32 JitRead16(Memory::MemorySystem* memory, u32 addr) {
++    return memory->Read16(addr);
++}
++u32 JitRead32(Memory::MemorySystem* memory, u32 addr) {
++    return memory->Read32(addr);
++}
++void JitWrite8(Memory::MemorySystem* memory, u32 addr, u32 value) {
++    memory->Write8(addr, static_cast<u8>(value));
++}
++void JitWrite16(Memory::MemorySystem* memory, u32 addr, u32 value) {
++    memory->Write16(addr, static_cast<u16>(value));
++}
++void JitWrite32(Memory::MemorySystem* memory, u32 addr, u32 value) {
++    memory->Write32(addr, value);
++}
++
++// Function types of the generated module
++enum : u8 { TypeVoid = 0, TypeII_I = 1, TypeIII = 2, TypeI_I = 3, TypeRun = 4 };
++// Locals of the generated function (all i32)
++// LFA/LFO/LFR keep the operands and result of the last flag-setting instruction so that a
++// following condition can be evaluated without materializing the flags. LT/LN: loop ticks/count.
++enum : u8 { LA = 0, LO = 1, LR = 2, LP = 3, LC = 4, LFA = 5, LFO = 6, LFR = 7, LT = 8, LN = 9 };
++constexpr u8 NUM_LOCALS = 10;
++
++class Emitter {
++public:
++    std::vector<u8> code;
++
++    void Byte(u8 b) {
++        code.push_back(b);
++    }
++    void U32(u32 v) {
++        do {
++            u8 b = v & 0x7F;
++            v >>= 7;
++            code.push_back(v ? (b | 0x80) : b);
++        } while (v);
++    }
++    void S32(s32 v) {
++        for (;;) {
++            const u8 b = v & 0x7F;
++            v >>= 7;
++            if ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40))) {
++                code.push_back(b);
++                return;
++            }
++            code.push_back(b | 0x80);
++        }
++    }
++    void Const(u32 v) {
++        Byte(0x41);
++        S32(static_cast<s32>(v));
++    }
++    template <typename T>
++    void Ptr(const T* p) {
++        Const(static_cast<u32>(reinterpret_cast<uintptr_t>(p)));
++    }
++    void Op(u8 op) {
++        Byte(op);
++    }
++    void Mem(u8 op, u8 align) {
++        Byte(op);
++        Byte(align);
++        Byte(0);
++    }
++    void Get(u8 local) {
++        Byte(0x20);
++        Byte(local);
++    }
++    void Set(u8 local) {
++        Byte(0x21);
++        Byte(local);
++    }
++    void Tee(u8 local) {
++        Byte(0x22);
++        Byte(local);
++    }
++    template <typename F>
++    void Call(F* fn, u8 type) {
++        Const(static_cast<u32>(reinterpret_cast<uintptr_t>(fn)));
++        Byte(0x11);
++        Byte(type);
++        Byte(0);
++    }
++};
++
++constexpr u8 I32Load = 0x28, I32Load8S = 0x2C, I32Load8U = 0x2D, I32Load16S = 0x2E,
++             I32Load16U = 0x2F, I32Store = 0x36, I32Store8 = 0x3A, I32Store16 = 0x3B;
++constexpr u8 If = 0x04, Else = 0x05, End = 0x0B, BlockVoid = 0x40, BlockI32 = 0x7F;
++constexpr u8 Return = 0x0F, Loop = 0x03, BrIf = 0x0D, Eqz = 0x45, Eq = 0x46, Ne = 0x47,
++             LtS = 0x48, LtU = 0x49, GtS = 0x4A, GtU = 0x4B, LeS = 0x4C, LeU = 0x4D, GeS = 0x4E,
++             GeU = 0x4F, Mul = 0x6C;
++constexpr u8 Add = 0x6A, Sub = 0x6B, And = 0x71, Or = 0x72, Xor = 0x73, Shl = 0x74, ShrS = 0x75,
++             ShrU = 0x76, Rotr = 0x78;
++
++} // namespace
++
++struct JitCompiler {
++    Emitter e;
++    InterpreterState& state;
++    Memory::MemorySystem* memory;
++
++    // What the generated code knows about the flags at this point (compile-time state)
++    enum class Known { Nothing, Sub, Result };
++    Known known = Known::Nothing;
++    bool in_loop = false;     // The run is wrapped in a loop (it branches to its own start)
++    u32 loop_target = 0;      // Guest address of the loop head
++    u32 ticks_done = 0;       // Ticks of the instructions emitted so far, including the current
++
++    // Pushes 1 if the condition passes
++    void Cond(u8 cond) {
++        const bool result_only = cond == 0 || cond == 1 || cond == 4 || cond == 5;
++        if (known == Known::Sub || (known == Known::Result && result_only)) {
++            switch (cond) {
++            case 0: // EQ
++                e.Get(LFR);
++                e.Op(Eqz);
++                return;
++            case 1: // NE
++                e.Get(LFR);
++                e.Const(0);
++                e.Op(Ne);
++                return;
++            case 4: // MI
++                e.Get(LFR);
++                e.Const(0);
++                e.Op(LtS);
++                return;
++            case 5: // PL
++                e.Get(LFR);
++                e.Const(0);
++                e.Op(GeS);
++                return;
++            case 2:  // CS
++            case 3:  // CC
++            case 8:  // HI
++            case 9:  // LS
++            case 10: // GE
++            case 11: // LT
++            case 12: // GT
++            case 13: // LE
++                static constexpr u8 ops[] = {0, 0, GeU, LtU, 0, 0, 0, 0, GtU, LeU, GeS, LtS, GtS, LeS};
++                e.Get(LFA);
++                e.Get(LFO);
++                e.Op(ops[cond]);
++                return;
++            default:
++                break;
++            }
++        }
++        e.Ptr(&state.lazy_flags);
++        e.Const(cond);
++        e.Call(&JitCond, TypeII_I);
++    }
++
++    // Emitted where a branch is taken: write the target and leave, or go round the loop again.
++    // Must be called inside exactly one `if`.
++    void TakeBranch(u32 target, bool to_start) {
++        if (in_loop && to_start) {
++            e.Get(LT);
++            e.Const(ticks_done);
++            e.Op(Add);
++            e.Set(LT);
++            e.Get(LN);
++            e.Const(1);
++            e.Op(Add);
++            e.Tee(LN);
++            e.Const(MAX_LOOP_ITERATIONS);
++            e.Op(LtU);
++            e.Op(BrIf);
++            e.Byte(1); // the enclosing `if` is depth 0, the loop depth 1
++            e.Ptr(&state.regs[15]);
++            e.Const(target);
++            e.Mem(I32Store, 2);
++            e.Get(LT);
++        } else {
++            e.Ptr(&state.regs[15]);
++            e.Const(target);
++            e.Mem(I32Store, 2);
++            e.Get(LT);
++            e.Const(ticks_done);
++            e.Op(Add);
++        }
++        Exit();
++    }
++    // ticks on the stack -> return (ticks << 1) | 1
++    void Exit() {
++        e.Const(1);
++        e.Op(Shl);
++        e.Const(1);
++        e.Op(Or);
++        e.Op(Return);
++    }
++
++    void LoadReg(u8 r) {
++        e.Ptr(&state.regs[r]);
++        e.Mem(I32Load, 2);
++    }
++
++    // Pushes value << / >> amount with ShiftNoCarry semantics. Returns false for RRX.
++    // The unshifted value must already be on the stack.
++    static bool ShiftSupported(ShiftType type, u8 amount) {
++        return amount < 32 && !(type == ShiftType::ROR && amount == 0);
++    }
++    void Shift(ShiftType type, u8 amount) {
++        switch (type) {
++        case ShiftType::LSL:
++            if (amount != 0) {
++                e.Const(amount);
++                e.Op(Shl);
++            }
++            break;
++        case ShiftType::LSR:
++            if (amount == 0) { // LSR #32
++                e.Op(0x1A);    // drop
++                e.Const(0);
++            } else {
++                e.Const(amount);
++                e.Op(ShrU);
++            }
++            break;
++        case ShiftType::ASR:
++            e.Const(amount == 0 ? 31 : amount); // ASR #0 encodes ASR #32
++            e.Op(ShrS);
++            break;
++        case ShiftType::ROR:
++            e.Const(amount);
++            e.Op(Rotr);
++            break;
++        }
++    }
++
++    static bool Op2Supported(const DecodedInst& i) {
++        if (i.dp.rm == 0xFF) {
++            return true;
++        }
++        return i.dp.rs == 0xFF && ShiftSupported(i.dp.shift_type, i.dp.shift_imm);
++    }
++
++    // Pushes operand 2 (GetOp2Fast). With want_carry, also updates local LC, which must already
++    // hold the current C flag, to the shifter carry-out (GetOp2/ShiftImm).
++    void Op2(const DecodedInst& i, bool want_carry) {
++        if (i.dp.rm == 0xFF) {
++            if (want_carry && (i.dp.flags & 1)) {
++                e.Const(((i.dp.imm >> 31) ^ (i.dp.flags >> 1)) & 1);
++                e.Set(LC);
++            }
++            e.Const(i.dp.imm);
++            return;
++        }
++        const ShiftType type = i.dp.shift_type;
++        const u8 amount = i.dp.shift_imm;
++        LoadReg(i.dp.rm);
++        if (want_carry && !(type == ShiftType::LSL && amount == 0)) {
++            // Carry-out is one bit of the unshifted value
++            u8 bit;
++            if (type == ShiftType::LSL) {
++                bit = 32 - amount;
++            } else if (amount == 0) {
++                bit = 31; // LSR/ASR #32
++            } else {
++                bit = amount - 1;
++            }
++            e.Tee(LR);
++            e.Get(LR);
++            e.Const(bit);
++            e.Op(ShrU);
++            e.Const(1);
++            e.Op(And);
++            e.Set(LC);
++        }
++        Shift(type, amount);
++    }
++
++    void SetFlagOp(FlagOp op) {
++        e.Ptr(&state.lazy_flags.op);
++        e.Const(static_cast<u32>(op));
++        e.Mem(I32Store8, 0);
++    }
++    void StoreFlagField(const u32* field, u8 local) {
++        e.Ptr(field);
++        e.Get(local);
++        e.Mem(I32Store, 2);
++    }
++
++    // Pushes the host page pointer for the guest address in LA (also kept in LP)
++    void PagePointer() {
++        e.Ptr(&state.page_pointers);
++        e.Mem(I32Load, 2);
++        e.Get(LA);
++        e.Const(FASTINTERP_PAGE_BITS);
++        e.Op(ShrU);
++        e.Const(2);
++        e.Op(Shl);
++        e.Op(Add);
++        e.Mem(I32Load, 2);
++        e.Tee(LP);
++    }
++    void HostAddress() {
++        e.Get(LP);
++        e.Get(LA);
++        e.Const(FASTINTERP_PAGE_MASK);
++        e.Op(And);
++        e.Op(Add);
++    }
++
++    // regs[rd] = read(LA)
++    void Read(u8 rd, u8 size, bool sign) {
++        e.Ptr(&state.regs[rd]);
++        PagePointer();
++        e.Op(If);
++        e.Op(BlockI32);
++        HostAddress();
++        e.Mem(size == 4 ? I32Load
++                        : size == 2 ? (sign ? I32Load16S : I32Load16U)
++                                    : (sign ? I32Load8S : I32Load8U),
++              0);
++        e.Op(Else);
++        e.Ptr(memory);
++        e.Get(LA);
++        if (size == 4) {
++            e.Call(&JitRead32, TypeII_I);
++        } else if (size == 2) {
++            e.Call(&JitRead16, TypeII_I);
++            if (sign) {
++                e.Op(0xC1); // i32.extend16_s
++            }
++        } else {
++            e.Call(&JitRead8, TypeII_I);
++            if (sign) {
++                e.Op(0xC0); // i32.extend8_s
++            }
++        }
++        e.Op(End);
++        e.Mem(I32Store, 2);
++    }
++
++    // write(LA, regs[rd])
++    void Write(u8 rd, u8 size) {
++        PagePointer();
++        e.Op(If);
++        e.Op(BlockVoid);
++        HostAddress();
++        LoadReg(rd);
++        e.Mem(size == 4 ? I32Store : size == 2 ? I32Store16 : I32Store8, 0);
++        e.Op(Else);
++        e.Ptr(memory);
++        e.Get(LA);
++        LoadReg(rd);
++        if (size == 4) {
++            e.Call(&JitWrite32, TypeIII);
++        } else if (size == 2) {
++            e.Call(&JitWrite16, TypeIII);
++        } else {
++            e.Call(&JitWrite8, TypeIII);
++        }
++        e.Op(End);
++    }
++
++    // Leaves the effective address in LA after applying the addressing mode (generic Ldr/Str)
++    void EffectiveAddress(const DecodedInst& i) {
++        LoadReg(i.ls.rn);
++        e.Set(LA);
++        if (i.ls.rm != 0xFF) {
++            if (!(i.ls.flags & 0x01)) {
++                e.Const(0);
++            }
++            LoadReg(i.ls.rm);
++            Shift(i.ls.shift_type, i.ls.shift_imm);
++            if (!(i.ls.flags & 0x01)) {
++                e.Op(Sub); // U == 0: subtract the register offset
++            }
++        } else {
++            e.Const(static_cast<u32>(i.ls.offset));
++        }
++        e.Set(LO);
++        switch (i.ls.mode) {
++        case AddrMode::Offset:
++            e.Get(LA);
++            e.Get(LO);
++            e.Op(Add);
++            e.Set(LA);
++            break;
++        case AddrMode::PreIndex:
++            e.Get(LA);
++            e.Get(LO);
++            e.Op(Add);
++            e.Set(LA);
++            e.Ptr(&state.regs[i.ls.rn]);
++            e.Get(LA);
++            e.Mem(I32Store, 2);
++            break;
++        case AddrMode::PostIndex:
++            e.Ptr(&state.regs[i.ls.rn]);
++            e.Get(LA);
++            e.Get(LO);
++            e.Op(Add);
++            e.Mem(I32Store, 2);
++            break;
++        }
++    }
++
++    static bool Supported(const DecodedInst& i) {
++        switch (i.opcode) {
++        case Opcode::Nop:
++        case Opcode::PcSetup:
++            return true;
++        case Opcode::And:
++        case Opcode::Eor:
++        case Opcode::Sub:
++        case Opcode::Rsb:
++        case Opcode::Add:
++        case Opcode::Orr:
++        case Opcode::Mov:
++        case Opcode::Bic:
++        case Opcode::Mvn:
++        case Opcode::AndS:
++        case Opcode::EorS:
++        case Opcode::SubS:
++        case Opcode::RsbS:
++        case Opcode::AddS:
++        case Opcode::OrrS:
++        case Opcode::MovS:
++        case Opcode::BicS:
++        case Opcode::MvnS:
++            return i.rd != 15 && Op2Supported(i);
++        case Opcode::Cmp:
++        case Opcode::Cmn:
++        case Opcode::Tst:
++        case Opcode::Teq:
++            return Op2Supported(i);
++        case Opcode::Uxtb:
++        case Opcode::Uxth:
++        case Opcode::Sxtb:
++        case Opcode::Sxth:
++        case Opcode::Mul:
++            return i.rd != 15;
++        case Opcode::B:
++        case Opcode::Bl:
++        case Opcode::Bx:
++        case Opcode::FusedSubsBcc:
++        case Opcode::FusedSubsRegBcc:
++        case Opcode::FusedCmpBcc:
++        case Opcode::FusedCmpRegBcc:
++            return true;
++        case Opcode::Ldr:
++        case Opcode::LdrB:
++        case Opcode::LdrH:
++        case Opcode::LdrSB:
++        case Opcode::LdrSH:
++            if (i.rd == 15) {
++                return false;
++            }
++            [[fallthrough]];
++        case Opcode::Str:
++        case Opcode::StrB:
++        case Opcode::StrH:
++            return static_cast<u8>(i.ls.mode) <= static_cast<u8>(AddrMode::PostIndex) &&
++                   (i.ls.rm == 0xFF || ShiftSupported(i.ls.shift_type, i.ls.shift_imm));
++        case Opcode::LdrImm:
++        case Opcode::LdrBImm:
++        case Opcode::LdrHImm:
++        case Opcode::LdrLit:
++            return i.rd != 15;
++        case Opcode::StrImm:
++        case Opcode::StrBImm:
++        case Opcode::StrHImm:
++            return true;
++        default:
++            return false;
++        }
++    }
++
++    void Arithmetic(const DecodedInst& i, FlagOp op, bool writeback) {
++        LoadReg(i.dp.rn);
++        e.Set(LA);
++        Op2(i, false);
++        e.Set(LO);
++        if (op == FlagOp::Rsb) {
++            e.Get(LO);
++            e.Get(LA);
++            e.Op(Sub);
++        } else {
++            e.Get(LA);
++            e.Get(LO);
++            e.Op(op == FlagOp::Add || op == FlagOp::Cmn ? Add : Sub);
++        }
++        e.Set(LR);
++        if (writeback) {
++            e.Ptr(&state.regs[i.rd]);
++            e.Get(LR);
++            e.Mem(I32Store, 2);
++        }
++        FinishArithmetic(op);
++    }
++
++    // LA = operand 1, LO = operand 2, LR = result
++    void FinishArithmetic(FlagOp op) {
++        SetFlagOp(op);
++        StoreFlagField(&state.lazy_flags.result, LR);
++        StoreFlagField(&state.lazy_flags.operand1, LA);
++        StoreFlagField(&state.lazy_flags.operand2, LO);
++        e.Get(LA);
++        e.Set(LFA);
++        e.Get(LO);
++        e.Set(LFO);
++        e.Get(LR);
++        e.Set(LFR);
++        known = op == FlagOp::Sub || op == FlagOp::Cmp ? Known::Sub : Known::Result;
++    }
++
++    // SUBS/CMP + B<cond>. The handlers store packed flags; the lazy form is equivalent.
++    void Fused(const DecodedInst& i, bool reg, bool writeback, u32 block_start) {
++        LoadReg(i.fused.rn);
++        e.Set(LA);
++        if (reg) {
++            LoadReg(i.fused.rm);
++        } else {
++            e.Const(i.fused.imm);
++        }
++        e.Set(LO);
++        e.Get(LA);
++        e.Get(LO);
++        e.Op(Sub);
++        e.Set(LR);
++        if (writeback) {
++            e.Ptr(&state.regs[i.rd]);
++            e.Get(LR);
++            e.Mem(I32Store, 2);
++        }
++        FinishArithmetic(writeback ? FlagOp::Sub : FlagOp::Cmp);
++        Cond(i.fused.branch_cond);
++        e.Op(If);
++        e.Op(BlockVoid);
++        TakeBranch(i.fused.branch_target, i.fused.branch_target == block_start);
++        e.Op(End);
++    }
++
++    // Logical flag-setting ops. kind: 0 = and, 1 = eor, 2 = orr, 3 = bic, 4 = mov, 5 = mvn
++    void Logical(const DecodedInst& i, FlagOp op, int kind, bool writeback) {
++        // Pending flags must be materialized first: C and V are preserved from them
++        e.Ptr(&state.lazy_flags);
++        e.Call(&JitGetPacked, TypeI_I);
++        e.Const(29);
++        e.Op(ShrU);
++        e.Const(1);
++        e.Op(And);
++        e.Set(LC);
++        Op2(i, true);
++        if (kind == 3 || kind == 5) {
++            e.Const(0xFFFFFFFF);
++            e.Op(Xor);
++        }
++        if (kind <= 3) {
++            LoadReg(i.dp.rn);
++            e.Op(kind == 1 ? Xor : kind == 2 ? Or : And);
++        }
++        e.Set(LR);
++        if (writeback) {
++            e.Ptr(&state.regs[i.rd]);
++            e.Get(LR);
++            e.Mem(I32Store, 2);
++        }
++        SetFlagOp(op);
++        StoreFlagField(&state.lazy_flags.result, LR);
++        StoreFlagField(&state.lazy_flags.shifter_carry, LC);
++        e.Get(LR);
++        e.Set(LFR);
++        known = Known::Result;
++    }
++
++    // kind as in Logical, plus 6 = add, 7 = sub, 8 = rsb
++    void Plain(const DecodedInst& i, int kind) {
++        e.Ptr(&state.regs[i.rd]);
++        if (kind == 8) {
++            Op2(i, false);
++            LoadReg(i.dp.rn);
++            e.Op(Sub);
++        } else {
++            if (kind != 4 && kind != 5) {
++                LoadReg(i.dp.rn);
++            }
++            Op2(i, false);
++            if (kind == 3 || kind == 5) {
++                e.Const(0xFFFFFFFF);
++                e.Op(Xor);
++            }
++            switch (kind) {
++            case 0:
++            case 3:
++                e.Op(And);
++                break;
++            case 1:
++                e.Op(Xor);
++                break;
++            case 2:
++                e.Op(Or);
++                break;
++            case 6:
++                e.Op(Add);
++                break;
++            case 7:
++                e.Op(Sub);
++                break;
++            }
++        }
++        e.Mem(I32Store, 2);
++    }
++
++    static bool IsBranch(const DecodedInst& i) {
++        switch (i.opcode) {
++        case Opcode::B:
++        case Opcode::Bl:
++        case Opcode::Bx:
++        case Opcode::FusedSubsBcc:
++        case Opcode::FusedSubsRegBcc:
++        case Opcode::FusedCmpBcc:
++        case Opcode::FusedCmpRegBcc:
++            return true;
++        default:
++            return false;
++        }
++    }
++    static bool IsFused(const DecodedInst& i) {
++        return i.opcode == Opcode::FusedSubsBcc || i.opcode == Opcode::FusedSubsRegBcc ||
++               i.opcode == Opcode::FusedCmpBcc || i.opcode == Opcode::FusedCmpRegBcc;
++    }
++    // Guest bytes the instruction advances the PC by when it does not branch
++    static u32 SizeOf(const DecodedInst& i) {
++        if (i.opcode == Opcode::PcSetup) {
++            return 0;
++        }
++        return IsFused(i) ? i.fused.combined_size : i.inst_size;
++    }
++    // The branch target, if the instruction can branch to a fixed address
++    static bool StaticTarget(const DecodedInst& i, u32& target) {
++        if (i.opcode == Opcode::B) {
++            target = i.branch.target;
++            return true;
++        }
++        if (IsFused(i)) {
++            target = i.fused.branch_target;
++            return true;
++        }
++        return false;
++    }
++
++    void Extend(const DecodedInst& i, int kind) {
++        e.Ptr(&state.regs[i.rd]);
++        LoadReg(i.dp.rm);
++        if ((i.dp.shift_imm & 31) != 0) {
++            e.Const(i.dp.shift_imm & 31);
++            e.Op(Rotr);
++        }
++        switch (kind) {
++        case 0:
++            e.Const(0xFF);
++            e.Op(And);
++            break;
++        case 1:
++            e.Const(0xFFFF);
++            e.Op(And);
++            break;
++        case 2:
++            e.Op(0xC0); // i32.extend8_s
++            break;
++        case 3:
++            e.Op(0xC1); // i32.extend16_s
++            break;
++        }
++        e.Mem(I32Store, 2);
++    }
++
++    void Body(const DecodedInst& i, u32 block_start) {
++        switch (i.opcode) {
++        case Opcode::Nop:
++            break;
++        case Opcode::Uxtb:
++            Extend(i, 0);
++            break;
++        case Opcode::Uxth:
++            Extend(i, 1);
++            break;
++        case Opcode::Sxtb:
++            Extend(i, 2);
++            break;
++        case Opcode::Sxth:
++            Extend(i, 3);
++            break;
++        case Opcode::Mul:
++            e.Ptr(&state.regs[i.rd]);
++            LoadReg(i.mul.rm);
++            LoadReg(i.mul.rs);
++            e.Op(Mul);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::FusedSubsBcc:
++            Fused(i, false, true, block_start);
++            break;
++        case Opcode::FusedSubsRegBcc:
++            Fused(i, true, true, block_start);
++            break;
++        case Opcode::FusedCmpBcc:
++            Fused(i, false, false, block_start);
++            break;
++        case Opcode::FusedCmpRegBcc:
++            Fused(i, true, false, block_start);
++            break;
++        case Opcode::PcSetup:
++            e.Ptr(&state.regs[15]);
++            e.Const(i.imm32);
++            e.Mem(I32Store, 2);
++            break;
++        case Opcode::And:
++            Plain(i, 0);
++            break;
++        case Opcode::Eor:
++            Plain(i, 1);
++            break;
++        case Opcode::Orr:
++            Plain(i, 2);
++            break;
++        case Opcode::Bic:
++            Plain(i, 3);
++            break;
++        case Opcode::Mov:
++            Plain(i, 4);
++            break;
++        case Opcode::Mvn:
++            Plain(i, 5);
++            break;
++        case Opcode::Add:
++            Plain(i, 6);
++            break;
++        case Opcode::Sub:
++            Plain(i, 7);
++            break;
++        case Opcode::Rsb:
++            Plain(i, 8);
++            break;
++        case Opcode::AddS:
++            Arithmetic(i, FlagOp::Add, true);
++            break;
++        case Opcode::SubS:
++            Arithmetic(i, FlagOp::Sub, true);
++            break;
++        case Opcode::RsbS:
++            Arithmetic(i, FlagOp::Rsb, true);
++            break;
++        case Opcode::Cmp:
++            Arithmetic(i, FlagOp::Cmp, false);
++            break;
++        case Opcode::Cmn:
++            Arithmetic(i, FlagOp::Cmn, false);
++            break;
++        case Opcode::AndS:
++            Logical(i, FlagOp::And, 0, true);
++            break;
++        case Opcode::Tst:
++            Logical(i, FlagOp::And, 0, false);
++            break;
++        case Opcode::EorS:
++            Logical(i, FlagOp::Eor, 1, true);
++            break;
++        case Opcode::Teq:
++            Logical(i, FlagOp::Eor, 1, false);
++            break;
++        case Opcode::OrrS:
++            Logical(i, FlagOp::Orr, 2, true);
++            break;
++        case Opcode::BicS:
++            Logical(i, FlagOp::Bic, 3, true);
++            break;
++        case Opcode::MovS:
++            Logical(i, FlagOp::Mov, 4, true);
++            break;
++        case Opcode::MvnS:
++            Logical(i, FlagOp::Mvn, 5, true);
++            break;
++        case Opcode::Ldr:
++            EffectiveAddress(i);
++            Read(i.rd, 4, false);
++            break;
++        case Opcode::LdrB:
++            EffectiveAddress(i);
++            Read(i.rd, 1, false);
++            break;
++        case Opcode::LdrH:
++            EffectiveAddress(i);
++            Read(i.rd, 2, false);
++            break;
++        case Opcode::LdrSB:
++            EffectiveAddress(i);
++            Read(i.rd, 1, true);
++            break;
++        case Opcode::LdrSH:
++            EffectiveAddress(i);
++            Read(i.rd, 2, true);
++            break;
++        case Opcode::Str:
++            EffectiveAddress(i);
++            Write(i.rd, 4);
++            break;
++        case Opcode::StrB:
++            EffectiveAddress(i);
++            Write(i.rd, 1);
++            break;
++        case Opcode::StrH:
++            EffectiveAddress(i);
++            Write(i.rd, 2);
++            break;
++        case Opcode::LdrImm:
++        case Opcode::LdrBImm:
++        case Opcode::LdrHImm:
++        case Opcode::StrImm:
++        case Opcode::StrBImm:
++        case Opcode::StrHImm: {
++            LoadReg(i.ls.rn);
++            e.Const(static_cast<u32>(i.ls.offset));
++            e.Op(Add);
++            e.Set(LA);
++            const u8 size = i.opcode == Opcode::LdrImm || i.opcode == Opcode::StrImm
++                                ? 4
++                                : i.opcode == Opcode::LdrHImm || i.opcode == Opcode::StrHImm ? 2 : 1;
++            if (i.opcode == Opcode::LdrImm || i.opcode == Opcode::LdrBImm ||
++                i.opcode == Opcode::LdrHImm) {
++                Read(i.rd, size, false);
++            } else {
++                Write(i.rd, size);
++            }
++            break;
++        }
++        case Opcode::LdrLit:
++            e.Const(static_cast<u32>(i.ls.offset));
++            e.Set(LA);
++            Read(i.rd, 4, false);
++            break;
++        default:
++            break;
++        }
++    }
++
++    void Instruction(const DecodedInst& i, u32 block_start) {
++        ticks_done += i.opcode == Opcode::PcSetup ? 0 : i.ticks;
++        // Fused instructions are only created from unconditional pairs (no CHECK_COND)
++        const bool conditional = i.cond != 0xE && i.opcode != Opcode::PcSetup &&
++                                 i.opcode != Opcode::Nop && !IsFused(i);
++        if (i.opcode == Opcode::B || i.opcode == Opcode::Bl || i.opcode == Opcode::Bx) {
++            // Always inside an `if` so that TakeBranch/Exit see the same nesting
++            if (conditional) {
++                Cond(i.cond);
++            } else {
++                e.Const(1);
++            }
++            e.Op(If);
++            e.Op(BlockVoid);
++            if (i.opcode == Opcode::B) {
++                TakeBranch(i.branch.target, i.branch.target == block_start);
++            } else if (i.opcode == Opcode::Bl) {
++                e.Ptr(&state.regs[14]);
++                e.Const(i.branch.lr);
++                e.Mem(I32Store, 2);
++                TakeBranch(i.branch.target, false);
++            } else {
++                LoadReg(i.branch.rm);
++                e.Set(LA);
++                e.Ptr(&state.thumb_mode);
++                e.Get(LA);
++                e.Const(1);
++                e.Op(And);
++                e.Mem(I32Store8, 0);
++                e.Ptr(&state.regs[15]);
++                e.Get(LA);
++                e.Const(0xFFFFFFFE);
++                e.Op(And);
++                e.Mem(I32Store, 2);
++                e.Get(LT);
++                e.Const(ticks_done);
++                e.Op(Add);
++                Exit();
++            }
++            e.Op(End);
++            return;
++        }
++        if (conditional) {
++            Cond(i.cond);
++            e.Op(If);
++            e.Op(BlockVoid);
++        }
++        const Known before = known;
++        Body(i, block_start);
++        if (conditional) {
++            e.Op(End);
++            // A flag-setting instruction that may not have run leaves the flags unknown
++            if (known != before) {
++                known = Known::Nothing;
++            }
++        }
++    }
++
++    std::vector<u8> Module() {
++        Emitter m;
++        static constexpr u8 header[] = {
++            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
++            // Types: ()->(), (i32,i32)->i32, (i32,i32,i32)->(), (i32)->i32, ()->i32
++            0x01, 0x19, 0x05, 0x60, 0x00, 0x00, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x03,
++            0x7F, 0x7F, 0x7F, 0x00, 0x60, 0x01, 0x7F, 0x01, 0x7F, 0x60, 0x00, 0x01, 0x7F,
++            // Imports: env.m = shared memory (1..65536 pages), env.t = funcref table
++            0x02, 0x17, 0x02, 0x03, 'e', 'n', 'v', 0x01, 'm', 0x02, 0x03, 0x01, 0x80, 0x80, 0x04,
++            0x03, 'e', 'n', 'v', 0x01, 't', 0x01, 0x70, 0x00, 0x00,
++            // Function 0 has type 4; exported as "f"
++            0x03, 0x02, 0x01, 0x04, 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00};
++        m.code.assign(std::begin(header), std::end(header));
++        Emitter body;
++        body.Byte(0x01); // one group of locals
++        body.Byte(NUM_LOCALS);
++        body.Byte(0x7F);
++        if (in_loop) {
++            body.Byte(Loop);
++            body.Byte(BlockVoid);
++        }
++        body.code.insert(body.code.end(), e.code.begin(), e.code.end());
++        if (in_loop) {
++            body.Byte(End);
++        }
++        // Ran off the end of the run: return ticks << 1
++        body.Get(LT);
++        body.Const(ticks_done);
++        body.Op(Add);
++        body.Const(1);
++        body.Op(Shl);
++        body.Byte(End);
++        Emitter section;
++        section.Byte(0x01);
++        section.U32(static_cast<u32>(body.code.size()));
++        section.code.insert(section.code.end(), body.code.begin(), body.code.end());
++        m.Byte(0x0A);
++        m.U32(static_cast<u32>(section.code.size()));
++        m.code.insert(m.code.end(), section.code.begin(), section.code.end());
++        return std::move(m.code);
++    }
++};
++
++// Compiles the module and stores its function in a free slot of this thread's function table.
++// Returns the table index (a function pointer for C++), or 0 on failure.
++EM_JS(u32, JitInstall, (const u8* bytes, u32 size), {
++    try {
++        const module = new WebAssembly.Module(new Uint8Array(wasmMemory.buffer, bytes, size).slice());
++        const instance = new WebAssembly.Instance(module, {env: {m: wasmMemory, t: wasmTable}});
++        const s = Module.__jit || (Module.__jit = {next: 0, end: 0});
++        if (s.next >= s.end) {
++            s.next = wasmTable.length;
++            wasmTable.grow(4096);
++            s.end = s.next + 4096;
++        }
++        wasmTable.set(s.next, instance.exports.f);
++        return s.next++;
++    } catch (e) {
++        if (!Module.__jitFailed) {
++            Module.__jitFailed = true;
++            err('JIT: ' + e);
++        }
++        return 0;
++    }
++});
++
++void ARM_FastInterp::JitCompileBlock(BasicBlock* block) {
++    if (!jit_enabled || jit_functions >= MAX_JIT_FUNCTIONS) {
++        return;
++    }
++    const u32 count = block->inst_count;
++    u32 start = 0;
++    while (start < count) {
++        // A run is a maximal sequence of translatable instructions, cut after an unconditional
++        // branch (nothing after it would be reachable)
++        u32 end = start;
++        bool has_branch = false;
++        while (end < count && JitCompiler::Supported(block->instructions[end])) {
++            const DecodedInst& inst = block->instructions[end];
++            ++end;
++            if (JitCompiler::IsBranch(inst)) {
++                has_branch = true;
++                if (inst.cond == 0xE && !JitCompiler::IsFused(inst)) {
++                    break;
++                }
++            }
++        }
++        if (end - start < (has_branch ? MIN_BRANCH_RUN_LENGTH : MIN_RUN_LENGTH)) {
++            start = end + (end == start ? 1 : 0);
++            continue;
++        }
++        JitCompiler compiler{{}, state_, &memory_};
++        if (start == 0) {
++            for (u32 i = start; i < end; ++i) {
++                u32 target;
++                if (JitCompiler::StaticTarget(block->instructions[i], target) &&
++                    target == block->start_pc) {
++                    compiler.in_loop = true;
++                }
++            }
++        }
++        u32 bytes = 0;
++        for (u32 i = start; i < end; ++i) {
++            const DecodedInst& inst = block->instructions[i];
++            // Only a run that starts the block can loop back to it
++            compiler.Instruction(inst, start == 0 ? block->start_pc : 0xFFFFFFFF);
++            bytes += JitCompiler::SizeOf(inst);
++        }
++        const std::vector<u8> module = compiler.Module();
++        const u32 fn = JitInstall(module.data(), static_cast<u32>(module.size()));
++        if (fn == 0) {
++            jit_enabled = false;
++            return;
++        }
++        ++jit_functions;
++        DecodedInst& call = block->instructions[start];
++        call.opcode = Opcode::JitCall;
++        call.cond = 0xE;
++        call.jit.fn = fn;
++        call.jit.ticks = 0;
++        call.jit.count = static_cast<u8>(end - start);
++        call.jit.size = static_cast<u8>(bytes);
++        start = end;
++    }
++}
++
++} // namespace Core::FastInterp
++
++extern "C" {
++// Called by the frontend before a game is loaded
++EMSCRIPTEN_KEEPALIVE void web_jit_set_enabled(int enabled) {
++    Core::FastInterp::jit_enabled = enabled != 0;
++}
++EMSCRIPTEN_KEEPALIVE unsigned web_jit_function_count() {
++    return Core::FastInterp::jit_functions;
++}
++}
++
++#endif // __EMSCRIPTEN__
+diff --git a/src/core/arm/fastinterp/fastinterp_types.h b/src/core/arm/fastinterp/fastinterp_types.h
+index 18a6de596..6ce0aa834 100644
+--- a/src/core/arm/fastinterp/fastinterp_types.h
++++ b/src/core/arm/fastinterp/fastinterp_types.h
+@@ -452,6 +452,10 @@ enum class Opcode : u16 {
+     // inst_size and ticks are 0 (the following real instruction carries both).
+     PcSetup,
+ 
++    // Web build: run of instructions compiled to a WebAssembly function
++    // (fastinterp_jit_web.cpp). Never produced by the decoder.
++    JitCall,
++
+     OpcodeCount
+ };
+ 
+@@ -564,6 +568,14 @@ struct DecodedInst {
+             u32 branch_target; // Absolute taken-branch target (precomputed at decode)
+         } fused;
+ 
++        // JitCall: compiled run that replaces `count` decoded instructions
++        struct {
++            u32 fn;    // Function table index of the compiled code
++            u16 ticks; // Total tick cost of the run
++            u8 count;  // Number of decoded instructions the run covers
++            u8 size;   // Total size in bytes of the guest instructions
++        } jit;
++
+         // Generic 32-bit immediate
+         u32 imm32;
+     };
 diff --git a/src/core/file_sys/ncch_container.cpp b/src/core/file_sys/ncch_container.cpp
 index bf4abb023..3be846b8b 100644
 --- a/src/core/file_sys/ncch_container.cpp

@@ -136,6 +136,16 @@ try {
     const opt = (name) => { try { return Math.round(Module.ccall(name, 'number', [], []) * 10) / 10; } catch { return null; } };
     out.speedPercent = opt('web_get_speed');
     out.emuBusyPercent = opt('web_get_busy');
+    // 内訳（%）: GPU コマンド処理・画面出力・音声・処理の外で失った分。JIT で変換した関数の数
+    try {
+      out.profPercent = [0, 1, 2, 3].map(i => Math.round(Module.ccall('web_get_prof', 'number', ['number'], [i]) * 10) / 10);
+      out.jitFunctions = Module.ccall('web_jit_function_count', 'number', [], []);
+      // tools/cpubench の記録: 周回数（速度の指標）と途中のチェックサム（正しさの確認）
+      if (Module.ccall('web_peek32', 'number', ['number'], [0x00102000]) === 0x42454E43) {
+        out.benchIterations = Module.ccall('web_peek32', 'number', ['number'], [0x00102004]);
+        out.benchChecksum = (Module.ccall('web_peek32', 'number', ['number'], [0x00102008]) >>> 0).toString(16);
+      }
+    } catch {}
     try {
       const frames = Module.ccall('web_get_frame_count', 'number', [], []) - f0;
       out.frames = frames;

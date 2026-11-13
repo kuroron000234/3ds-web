@@ -11,6 +11,12 @@ static int arr[512];
 static float m[3][16];
 volatile u32 sink;
 
+// テスト側が読む記録（データ領域の先頭 = 0x00102000 に置く。link.ld を参照）:
+//   magic、外側のループを回った回数、CHECKPOINT 周目の sink（JIT の有無で一致するはず）
+#define CHECKPOINT 20
+struct Report { u32 magic; volatile u32 iterations; u32 checkpoint; };
+struct Report report __attribute__((section(".report"))) = {0x42454E43, 0, 0};
+
 static u32 rng_state = 12345;
 static inline u32 rng(void) {
     rng_state ^= rng_state << 13;
@@ -70,5 +76,6 @@ void _start(void) {
         sink += (u32)m[2][5];
         struct Node* n = &nodes[0];
         for (int i = 0; i < 20; i++) sink += walk(n);
+        if (++report.iterations == CHECKPOINT) report.checkpoint = sink;
     }
 }

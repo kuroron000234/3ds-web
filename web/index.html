@@ -41,6 +41,7 @@
       <option value="50">50%（もっと軽い）</option>
       <option value="25">25%</option>
     </select></label>
+    <label title="よく実行される部分を WebAssembly に変換して速くします（実験的）。ゲームの動作がおかしいときは切ってください"><input type="checkbox" id="jit"> JIT（実験的）</label>
     <span id="gpu"></span>
   </div>
   <canvas id="canvas" width="400" height="480"></canvas>
@@ -245,6 +246,7 @@
   const apiEl = document.getElementById('api');
   const scaleEl = document.getElementById('scale');
   const clockEl = document.getElementById('clock');
+  const jitEl = document.getElementById('jit');
   const gpuEl = document.getElementById('gpu');
   const store = {
     get(k) { try { return localStorage.getItem('3ds-web.' + k); } catch { return null; } },
@@ -256,6 +258,8 @@
   if (!scaleEl.value) scaleEl.value = '1';
   clockEl.value = store.get('clock') || '100';
   if (!clockEl.value) clockEl.value = '100';
+  jitEl.checked = store.get('jit') !== 'off';
+  jitEl.addEventListener('change', () => { store.set('jit', jitEl.checked ? 'on' : 'off'); updateGfxUi(); });
   if (!gpu.webgl2) apiEl.querySelector('option[value=OpenGL]').disabled = true;
   // 自動: WebGL2 があれば常にそれを使う。CPU 代行の WebGL でもソフトウェア描画より速い
   // （SwiftShader での実測: WebGL2 は実機比 35%、ソフトウェア描画は 4%）
@@ -285,6 +289,7 @@
     Module.ccall('web_set_option', null, ['string', 'string'], ['citra_graphics_api', api]);
     Module.ccall('web_set_option', null, ['string', 'string'], ['citra_resolution_factor', scale]);
     Module.ccall('web_set_option', null, ['string', 'string'], ['citra_cpu_clock_percentage', clockEl.value]);
+    Module.ccall('web_set_option', null, ['string', 'string'], ['web_jit', jitEl.checked ? 'enabled' : 'disabled']);
     log(`描画: ${api === 'OpenGL' ? 'GPU（WebGL2）' : 'CPU（ソフトウェア）'}、解像度 ${scale} 倍`);
     gameStarted = true;
     updateGfxUi();

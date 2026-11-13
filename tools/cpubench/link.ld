@@ -7,7 +7,7 @@ SECTIONS {
     . = ALIGN(0x1000);
     .rodata : { *(.rodata*) *(.ARM.*) } :rodata
     . = ALIGN(0x1000);
-    .data : { *(.data*) } :data
+    .data : { *(.report) *(.data*) } :data
     .bss : { *(.bss*) *(COMMON) } :data
     . = ALIGN(0x1000);
     /DISCARD/ : { *(.comment) *(.note*) }
